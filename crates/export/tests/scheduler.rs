@@ -154,9 +154,17 @@ fn audio_of(path: &Path) -> Vec<f32> {
     effectcraft_media::MediaPool::new().audio_samples(&f, Tick::ZERO, 4 * 48_000, 48_000)
 }
 
+/// Decoded frames of `path`'s 40-frame, 10 fps video track.
+fn video_of(path: &Path) -> Vec<effectcraft_raster::Image> {
+    let f = effectcraft_media::probe(path).expect("probe");
+    let pool = effectcraft_media::MediaPool::new();
+    (0..40).map(|k| (*pool.frame_at(&f, Tick::from_seconds_f64((k as f64 + 0.5) / 10.0)).expect("decode")).clone()).collect()
+}
+
 /// The scheduler changes how frames are rendered, not what the output holds. Without audio, a
 /// scheduled export (frames rendered by the "GPU" worker, or declined to the CPU) writes the same
-/// bytes as the CPU export in every container and image format. With audio, the scheduled export
+/// bytes as the CPU export in every container and image format, except WebM, whose clusters
+/// follow the render batches, so its decoded frames are compared instead. With audio, the scheduled export
 /// interleaves audio after every frame instead of after every batch, so the container bytes
 /// differ, but the video is the same and the decoded audio is sample-identical.
 #[test]
@@ -217,6 +225,10 @@ fn other_formats_and_audio_match_the_cpu_export() {
                 let want = audio_of(Path::new(&outs[0].2));
                 assert!(!want.is_empty(), "{name}: no audio decoded");
                 assert!(audio_of(Path::new(&o.2)) == want, "{name}: decoded audio differs from the CPU export");
+            } else if fmt == OutputFormat::WebM {
+                // Clusters follow the render batches, which differ with the scheduler and the
+                // thread count; the VP9 frames are the same.
+                assert!(video_of(Path::new(&o.2)) == video_of(Path::new(&outs[0].2)), "{name}: decoded video differs from the CPU export");
             } else {
                 assert!(o.1 == outs[0].1, "{name}: differs from the CPU export");
             }
