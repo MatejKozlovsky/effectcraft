@@ -636,16 +636,36 @@ mod oom_tests {
         assert_eq!(o.on_error(ErrorKind::Validation), OnError::Retire);
         let before = o.count();
         assert_eq!(o.on_error(ErrorKind::OutOfMemory), OnError::Absorb);
-        // The invalid resources it left fail validation: absorbed until the frame is declined.
+        // The invalid resources it left fail validation: absorbed until the frame is declined,
+        // and counted, so work recorded after the failed allocation sees it too.
         assert_eq!(o.on_error(ErrorKind::Validation), OnError::Absorb);
-        assert_eq!(o.count(), before + 1);
+        assert_eq!(o.count(), before + 2);
         o.settle();
         assert_eq!(o.on_error(ErrorKind::Validation), OnError::Retire);
         // Drivers that report a failed allocation as an internal error count too.
         assert_eq!(o.on_error(ErrorKind::Internal), OnError::Absorb);
-        assert_eq!(o.count(), before + 2);
+        assert_eq!(o.count(), before + 3);
         drop(armed);
         assert_eq!(o.on_error(ErrorKind::OutOfMemory), OnError::Retire);
-        assert_eq!(o.count(), before + 2);
+        assert_eq!(o.count(), before + 3);
+    }
+
+    /// The wrong-layers bug: a readback that starts after the failed allocation (a layer the
+    /// frame renders on the CPU, its effect chain run on the GPU) only sees the validation
+    /// errors of the invalid resources. They must change the count, or the readback returns a
+    /// reused staging buffer's earlier pixels and they reach the layer cache.
+    #[test]
+    fn validation_after_a_failed_allocation_invalidates_later_readbacks() {
+        let o = Oom::default();
+        let _armed = o.arm();
+        assert_eq!(o.on_error(ErrorKind::OutOfMemory), OnError::Absorb);
+        let readback_start = o.count();
+        assert_eq!(o.on_error(ErrorKind::Validation), OnError::Absorb);
+        assert_ne!(o.count(), readback_start, "the readback would be kept");
+        // Once the declined frame settled, validation errors retire the device and no longer count.
+        o.settle();
+        let after = o.count();
+        assert_eq!(o.on_error(ErrorKind::Validation), OnError::Retire);
+        assert_eq!(o.count(), after);
     }
 }
