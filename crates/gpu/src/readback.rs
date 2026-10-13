@@ -87,7 +87,12 @@ impl Oom {
                 self.tainted.store(true, SeqCst);
                 OnError::Absorb
             }
-            ErrorKind::Validation if self.tainted.load(SeqCst) => OnError::Absorb,
+            ErrorKind::Validation if self.tainted.load(SeqCst) => {
+                // Still invalidates whatever frame recorded it (it may be a frame that started
+                // after the failed allocation, on another thread): count it, or that frame is kept.
+                self.count.fetch_add(1, SeqCst);
+                OnError::Absorb
+            }
             ErrorKind::Validation => OnError::Retire,
         }
     }
