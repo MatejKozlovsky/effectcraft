@@ -1243,6 +1243,7 @@ impl<'g> Enc<'g> {
         if !self.g.can_wait() {
             return None;
         }
+        let oom = self.g.readbacks.1.count();
         self.g.transfers.count(false, out.len());
         let layout =
             crate::readback::Layout::new(w, h, bpp, self.g.device.limits().max_buffer_size).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
@@ -1268,6 +1269,12 @@ impl<'g> Enc<'g> {
         );
         self.submit();
         let bytes = self.g.read_buffer(&buf, row, padded as usize, h as usize).map_err(|e| log::error!("gpu texture readback: {e}")).ok()?;
+        // An absorbed OOM means the copy above (or the work that filled `texture`) may not
+        // have run: a reused staging buffer then still holds an earlier readback's pixels.
+        if self.g.readbacks.1.count() != oom {
+            log::warn!("gpu texture readback discarded: device ran out of memory while it was recorded");
+            return None;
+        }
         if bytes.len() != out.len() {
             log::error!("gpu texture readback size mismatch");
             return None;
