@@ -346,9 +346,6 @@ impl<'a> Cx<'a> {
                 let worker = if w < gpu { None } else { Some(w - gpu) };
                 s.spawn(move || {
                     let _alive = q.alive();
-                    if worker.is_none() {
-                        knobs.tune_gpu_thread(w);
-                    }
                     let pool = if worker.is_none() { gpu_pool } else { cpu_pool };
                     // Runs on a pool thread when the worker has a pool (its rayon jobs stay in that pool).
                     let in_pool = |job: &mut (dyn FnMut() + Send)| match pool {
@@ -1094,26 +1091,17 @@ mod tests {
     }
 }
 
-/// The scheduler's thread options (`gpu-pool`, `cpu-pool`, `gpu-priority`, `gpu-ideal-cpu`).
+/// The scheduler's thread options (`gpu-pool`, `cpu-pool`).
 #[derive(Debug, Default)]
 pub(crate) struct Knobs {
     pub gpu_pool: Option<usize>,
     pub cpu_pool: Option<usize>,
-    #[cfg_attr(target_arch = "wasm32", allow(dead_code))]
-    pub gpu_priority: bool,
-    #[cfg_attr(not(windows), allow(dead_code))]
-    pub gpu_ideal_cpu: Option<u32>,
 }
 
 impl Knobs {
     pub fn from_tuning(t: &crate::tuning::ExportTuning) -> Knobs {
         let nz = |n: usize| (n > 0).then_some(n);
-        Knobs {
-            gpu_pool: nz(t.gpu_pool.value),
-            cpu_pool: if t.cpu_frames.value.max() > 0 { nz(t.cpu_pool.value) } else { None },
-            gpu_priority: t.gpu_priority.value,
-            gpu_ideal_cpu: t.gpu_ideal_cpu.value,
-        }
+        Knobs { gpu_pool: nz(t.gpu_pool.value), cpu_pool: if t.cpu_frames.value.max() > 0 { nz(t.cpu_pool.value) } else { None } }
     }
 
     fn pool(&self, n: Option<usize>, name: &'static str) -> Option<rayon::ThreadPool> {
@@ -1124,21 +1112,6 @@ impl Knobs {
             .build()
             .map_err(|e| log::warn!(target: "effectcraft_export", "{name} pool: {e}"))
             .ok()
-    }
-
-    fn tune_gpu_thread(&self, _w: usize) {
-        #[cfg(not(target_arch = "wasm32"))]
-        if self.gpu_priority
-            && let Err(e) = thread_priority::set_current_thread_priority(thread_priority::ThreadPriority::Max)
-        {
-            log::warn!(target: "effectcraft_export", "gpu worker priority: {e:?}");
-        }
-        #[cfg(windows)]
-        if let Some(n) = self.gpu_ideal_cpu
-            && let Err(e) = thread_priority::windows::set_current_thread_ideal_processor(n)
-        {
-            log::warn!(target: "effectcraft_export", "gpu worker ideal processor: {e:?}");
-        }
     }
 }
 

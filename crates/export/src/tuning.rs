@@ -30,8 +30,6 @@ pub struct Overrides {
     pub cpu_frames: Option<usize>,
     pub cpu_pool: Option<usize>,
     pub gpu_pool: Option<usize>,
-    pub gpu_priority: Option<bool>,
-    pub gpu_ideal_cpu: Option<u32>,
     pub cache_mb: Option<usize>,
     pub precomp_resident: Option<bool>,
     pub gpu_yuv: Option<bool>,
@@ -52,8 +50,6 @@ pub const OPTIONS: &[(&str, &str)] = &[
     ("cpu-frames", "N|auto: CPU compositor workers next to the GPU (auto: adaptive by throughput)"),
     ("cpu-pool", "N: threads shared by the CPU workers' intra-frame work (0 = the whole pool)"),
     ("gpu-pool", "N: a rayon pool of its own for the GPU workers (0 = the global pool)"),
-    ("gpu-priority", "on|off: raise the GPU worker threads' priority"),
-    ("gpu-ideal-cpu", "N: preferred logical CPU of the GPU worker (Windows)"),
     ("cache-mb", "MB: export layer cache (static layers render and upload once; 0 = off)"),
     ("precomp-resident", "on|off: render precomp layers' nested comps resident on the GPU (not on the CPU + upload)"),
     ("gpu-yuv", "on|off: convert H.264 frames to 4:2:0 on the GPU (12 MB readback at 4K)"),
@@ -93,8 +89,6 @@ impl Overrides {
             "cpu-frames" => put!(cpu_frames, num()),
             "cpu-pool" => put!(cpu_pool, num()),
             "gpu-pool" => put!(gpu_pool, num()),
-            "gpu-priority" => put!(gpu_priority, flag()),
-            "gpu-ideal-cpu" => put!(gpu_ideal_cpu, num().map(|n| n as u32)),
             "cache-mb" => put!(cache_mb, num()),
             "precomp-resident" => put!(precomp_resident, flag()),
             "gpu-yuv" => put!(gpu_yuv, flag()),
@@ -266,8 +260,6 @@ pub struct ExportTuning {
     pub cpu_frames: Setting<CpuWorkers>,
     pub cpu_pool: Setting<usize>,
     pub gpu_pool: Setting<usize>,
-    pub gpu_priority: Setting<bool>,
-    pub gpu_ideal_cpu: Setting<Option<u32>>,
     pub cache_mb: Setting<usize>,
     pub cpu_batch: Setting<usize>,
     pub precomp_resident: Setting<bool>,
@@ -331,6 +323,9 @@ fn set<T>(value: T, source: Source, why: &str) -> Setting<T> {
 }
 
 /// Resolve every option: `layers` in precedence order (CLI, env, config), then the auto rules.
+/// The stock export layer cache (`LayerCache::default()`): 1 GiB.
+pub const STOCK_CACHE_MB: usize = 1024;
+
 pub fn resolve(hw: &Hardware, frame: (u32, u32), layers: [(&Overrides, Source); 3]) -> ExportTuning {
     macro_rules! given {
         ($f:ident) => {
@@ -529,21 +524,9 @@ pub fn resolve(hw: &Hardware, frame: (u32, u32), layers: [(&Overrides, Source); 
         Some((v, s)) => set(v, s, &format!("set on the {}", user(s))),
         None => set(0, Source::Auto, "the global pool"),
     };
-    let gpu_priority = match given!(gpu_priority) {
-        Some((v, s)) => set(v, s, &format!("set on the {}", user(s))),
-        None => set(false, Source::Auto, "normal priority (no measured gain)"),
-    };
-    let gpu_ideal_cpu = match given!(gpu_ideal_cpu) {
-        Some((v, s)) => set(Some(v), s, &format!("set on the {}", user(s))),
-        None => set(None, Source::Auto, "the OS schedules it"),
-    };
     let cache_mb = match given!(cache_mb) {
         Some((v, s)) => set(v, s, &format!("set on the {}", user(s))),
-        None if ram.value > 0 && ram.value * 15 / 100 < 4096 => {
-            set(ram.value * 15 / 100, Source::Auto, &format!("the job-wide layer cache, bounded to 15% of {} MB RAM", ram.value))
-        }
-        None if !use_gpu => set(4096, Source::Auto, "the job-wide layer cache (static layers render once), bounded"),
-        None => set(4096, Source::Auto, "the job-wide layer cache: static layers render and upload once"),
+        None => set(STOCK_CACHE_MB, Source::Auto, "the job-wide layer cache at the stock 1 GiB (a larger one is opt-in)"),
     };
     // CPU-compositor frames rendered at once (stock: one per thread), capped so their working
     // memory (~8 × the frame's f32 buffer each) fits 60% of the RAM budget after the layer cache.
@@ -596,8 +579,6 @@ pub fn resolve(hw: &Hardware, frame: (u32, u32), layers: [(&Overrides, Source); 
         cpu_frames,
         cpu_pool,
         gpu_pool,
-        gpu_priority,
-        gpu_ideal_cpu,
         cache_mb,
         cpu_batch,
         precomp_resident,
@@ -675,8 +656,6 @@ impl ExportTuning {
         row!("cpu-frames", self.cpu_frames);
         row!("cpu-pool", self.cpu_pool);
         row!("gpu-pool", self.gpu_pool);
-        row!("gpu-priority", self.gpu_priority);
-        row!("gpu-ideal-cpu", self.gpu_ideal_cpu);
         row!("cache-mb", self.cache_mb);
         row!("cpu-batch", self.cpu_batch);
         row!("precomp-resident", self.precomp_resident);
@@ -786,7 +765,7 @@ mod tests {
     fn cpu_batch_fits_the_ram_budget() {
         // No RAM reported: stock (a frame per thread).
         assert_eq!(auto(&hw(None, 16), UHD).cpu_batch.value, 16);
-        // 4 GB budget at 4K: ~1013 MB per CPU frame, 60% of 4096 - 614 cache = 1843 MB: 1 frame.
+        // 4 GB budget at 4K: ~1013 MB per CPU frame, 60% of 4096 - 1024 cache = 1433 MB: 1 frame.
         let mut cli = Overrides::default();
         cli.set("ram-budget-mb", "4096").unwrap();
         let n = Overrides::default();
@@ -808,7 +787,7 @@ mod tests {
         let t = auto(&m4(11, 10), (1920, 1080));
         assert_eq!((t.backend.value, t.gpu_inflight.value, t.upload_budget_mb.value), (Backend::Auto, 1, 1024));
         assert_eq!((t.cpu_frames.value, t.cpu_pool.value), (CpuWorkers::Adaptive { max: 6 }, 6));
-        assert_eq!(t.cache_mb.value, 2457);
+        assert_eq!(t.cache_mb.value, STOCK_CACHE_MB);
         // Little available now: the budget shrinks and 1080p falls back to the CPU too.
         let t = auto(&m4(3, 10), (1920, 1080));
         assert_eq!(t.vram_budget_mb.value, 1843);
@@ -835,7 +814,7 @@ mod tests {
         for threads in [4, 8, 16, 32] {
             let t = auto(&hw(None, threads), UHD);
             assert_eq!(t.plan(false), Plan::Parallel(Backend::Auto));
-            assert_eq!(t.cache_mb.value, 4096);
+            assert_eq!(t.cache_mb.value, STOCK_CACHE_MB);
             assert!(!t.gpu_yuv.value && !t.async_readback.value);
             assert!(t.warnings.is_empty());
         }

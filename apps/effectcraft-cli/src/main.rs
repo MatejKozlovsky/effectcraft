@@ -179,8 +179,6 @@ const VALUED: &[&str] = &[
     "--cpu-frames",
     "--cpu-pool",
     "--gpu-pool",
-    "--gpu-priority",
-    "--gpu-ideal-cpu",
     "--cache-mb",
     "--precomp-resident",
     "--gpu-yuv",

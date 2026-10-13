@@ -23,9 +23,7 @@ Config file: `--tuning-config FILE` or `EFFECTCRAFT_EXPORT_CONFIG=FILE` (`key = 
 | `cpu-frames` | N, auto | adaptive: start GPU-only, add CPU workers while measured frames/s improves, max min(threads/2, 8); 0 with `backend gpu` |
 | `cpu-pool` | N (0 = global pool) | threads/2 when there are CPU workers |
 | `gpu-pool` | N (0 = global pool) | 0 |
-| `gpu-priority` | on, off | off |
-| `gpu-ideal-cpu` | N | unset (Windows only) |
-| `cache-mb` | MB (0 = off) | 4096: the job-wide layer cache, bounded (stock leaves it unbounded) |
+| `cache-mb` | MB (0 = off) | 1024: the job-wide layer cache at the stock 1 GiB; a larger cache is opt-in |
 | `precomp-resident` | on, off | on with a GPU: precomp layers' nested comps render on the GPU (2D precomp layers without masks/styles/proxies/overrides/frame blending; others take the CPU path) |
 | `gpu-yuv` | on, off | on with a native GPU (H.264 only; byte-identical to the CPU conversion) |
 | `async-readback` | on, off | on when `gpu-yuv` is on (off = wait for each frame) |
