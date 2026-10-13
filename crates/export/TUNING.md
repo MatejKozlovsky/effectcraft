@@ -8,7 +8,8 @@ spellings, resolved per export with precedence **CLI > environment > config file
 | `--gpu-inflight 3`    | `EFFECTCRAFT_EXPORT_GPU_INFLIGHT=3`  | `gpu-inflight = 3`   |
 
 Config file: `--tuning-config FILE` or `EFFECTCRAFT_EXPORT_CONFIG=FILE` (`key = value` lines,
-`#` comments). The value `auto` (or leaving an option out) lets the auto rules decide.
+`#` comments). The CLI reads the environment variables and the config file and passes them to the
+export library (`tuning::Request`); other callers pass their own values or none. The value `auto` (or leaving an option out) lets the auto rules decide.
 `--print-tuning` prints every resolved value, where it came from and why, and renders nothing.
 `--threads N` / `EFFECTCRAFT_EXPORT_THREADS` sizes the rayon pool (simulates a smaller CPU).
 `RUST_LOG=effectcraft_export=info` logs the same table at the start of every export.
@@ -29,7 +30,7 @@ Config file: `--tuning-config FILE` or `EFFECTCRAFT_EXPORT_CONFIG=FILE` (`key = 
 | `async-readback` | on, off | on when `gpu-yuv` is on (off = wait for each frame) |
 | `cpu-batch` | N | one CPU-compositor frame per thread, capped so ~8x the frame buffer each fits 60% of the RAM budget after the layer cache |
 | `ram-budget-mb` | MB | detected RAM: unified-memory GPUs plan from it; the layer cache is capped at 15% of it |
-| `vram-budget-mb` | MB | detected dedicated VRAM (amdgpu sysfs on Linux); unified memory: from RAM; else 2048 |
+| `vram-budget-mb` | MB | dedicated VRAM measured by the CLI (`nvidia-smi`; amdgpu sysfs on Linux); unified memory: from RAM; else 2048 |
 | `upload-budget-mb` | MB | 25% of the VRAM budget, clamped to 256..1536 (a warning is logged once when it overflows) |
 | `pool-budget-mb` | MB | 5% of the VRAM budget, clamped to 128..768 |
 
@@ -64,10 +65,11 @@ Config file: `--tuning-config FILE` or `EFFECTCRAFT_EXPORT_CONFIG=FILE` (`key = 
 
 * Detected from the adapter (integrated, or an Apple GPU). There is no separate VRAM: the GPU budget
   (`vram-budget-mb`) is min(40% of RAM, 60% of the RAM available when the export starts); RAM and
-  availability come from `sysctl hw.memsize` + `vm_stat` (macOS) or `/proc/meminfo` (Linux).
+  availability come from `sysctl hw.memsize` + `vm_stat` (macOS) or `/proc/meminfo` (Linux), measured by
+  the CLI and passed in (`tuning::Host`); the export library itself spawns no processes and reads no system files.
 * The upload cache gets 256 MB plus what the frame slots leave of that budget (at most 1024 MB): an
   upload is a copy within shared memory, so frame slots come first.
-* The CPU layer cache is capped at 15% of RAM (it competes with the GPU for the same memory).
+* The CPU layer cache stays at the stock 1 GiB unless `cache-mb` asks for more.
 * Performance/efficiency cores (`hw.perflevel0/1`): adaptive CPU workers and their pool use at most
   the efficiency cores; the performance cores stay with the GPU worker's CPU side and the encoder.
   With `--threads N` the split is scaled to N.

@@ -9,7 +9,8 @@
 //! | `--gpu-inflight 3` | `EFFECTCRAFT_EXPORT_GPU_INFLIGHT=3`  | `gpu-inflight = 3`|
 //!
 //! The config file is `--tuning-config FILE` or `EFFECTCRAFT_EXPORT_CONFIG=FILE` (`key = value`
-//! lines, `#` comments). `auto` (or no value anywhere) lets [`resolve`] decide from the
+//! lines, `#` comments). The caller (the CLI) reads the environment, the config file and the
+//! host facts and passes them in a [`Request`]; this crate probes and reads nothing itself. `auto` (or no value anywhere) lets [`resolve`] decide from the
 //! [`Hardware`]: GPU presence, adapter limits, VRAM (or a conservative guess), core count;
 //! [`ExportTuning::explain`] says what it chose and why (`--print-tuning`).
 //!
@@ -103,11 +104,8 @@ impl Overrides {
         Ok(())
     }
 
-    /// The `EFFECTCRAFT_EXPORT_*` variables (invalid values are logged and ignored).
-    pub fn from_env() -> Overrides {
-        Overrides::from_lookup(|k| std::env::var(k).ok())
-    }
-
+    /// The `EFFECTCRAFT_EXPORT_*` variables as `get` returns them (the CLI passes the process
+    /// environment; invalid values are logged and ignored).
     pub fn from_lookup(get: impl Fn(&str) -> Option<String>) -> Overrides {
         let mut o = Overrides::default();
         for (key, _) in OPTIONS {
@@ -145,7 +143,11 @@ pub fn env_name(key: &str) -> String {
 #[derive(Clone, Debug, Default)]
 pub struct Request {
     pub cli: Overrides,
+    /// The `EFFECTCRAFT_EXPORT_*` variables ([`Overrides::from_lookup`]).
+    pub env: Overrides,
     pub config: Option<Overrides>,
+    /// What the caller measured of the host; the library probes nothing itself.
+    pub host: Host,
     /// `--print-tuning`: resolve, print, render nothing.
     pub print_only: bool,
 }
@@ -158,16 +160,22 @@ pub fn set_request(r: Request) {
 }
 
 pub(crate) fn request() -> Request {
-    let mut r = REQUEST.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default();
-    if r.config.is_none()
-        && let Ok(path) = std::env::var("EFFECTCRAFT_EXPORT_CONFIG")
-    {
-        match std::fs::read_to_string(&path).map_err(|e| e.to_string()).and_then(|t| Overrides::from_config(&t)) {
-            Ok(c) => r.config = Some(c),
-            Err(e) => log::warn!(target: "effectcraft_export", "EFFECTCRAFT_EXPORT_CONFIG {path}: {e} (ignored)"),
-        }
-    }
-    r
+    REQUEST.lock().unwrap_or_else(|e| e.into_inner()).clone().unwrap_or_default()
+}
+
+/// Host facts the caller measured (the CLI: `/proc/meminfo`, `sysctl`/`vm_stat`, CIM,
+/// `nvidia-smi`, sysfs). `None` = unknown: the tuning then plans conservatively.
+#[derive(Clone, Debug, Default, PartialEq)]
+pub struct Host {
+    /// Physical memory and memory available now (free + reclaimable).
+    pub ram_bytes: Option<u64>,
+    pub avail_ram_bytes: Option<u64>,
+    /// Performance / efficiency logical cores (Apple silicon, hybrid CPUs).
+    pub core_kinds: Option<(usize, usize)>,
+    /// Dedicated VRAM of the largest NVIDIA GPU (`nvidia-smi`), used for an NVIDIA adapter.
+    pub nvidia_vram_bytes: Option<u64>,
+    /// Dedicated VRAM another way (Linux sysfs, amdgpu), used for other adapters.
+    pub other_vram_bytes: Option<u64>,
 }
 
 /// The machine an export plans for.

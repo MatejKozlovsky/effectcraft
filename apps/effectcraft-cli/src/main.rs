@@ -41,6 +41,7 @@
 
 use std::io::Write;
 
+mod export_host;
 mod template;
 
 use effectcraft_automation::tools::{self, Reply};
@@ -405,16 +406,15 @@ fn export_tuning(args: &Args) -> Result<(), Failure> {
             cli.set(key, v).map_err(Failure::Usage)?;
         }
     }
+    let read = |p: &str| std::fs::read_to_string(p).map_err(|e| e.to_string()).and_then(|t| Overrides::from_config(&t));
     let config = match args.opt("--tuning-config") {
-        Some(p) => Some(
-            std::fs::read_to_string(p)
-                .map_err(|e| e.to_string())
-                .and_then(|t| Overrides::from_config(&t))
-                .map_err(|e| Failure::Usage(format!("--tuning-config {p}: {e}")))?,
-        ),
-        None => None,
+        Some(p) => Some(read(p).map_err(|e| Failure::Usage(format!("--tuning-config {p}: {e}")))?),
+        None => std::env::var("EFFECTCRAFT_EXPORT_CONFIG")
+            .ok()
+            .and_then(|p| read(&p).map_err(|e| eprintln!("warning: EFFECTCRAFT_EXPORT_CONFIG {p}: {e} (ignored)")).ok()),
     };
-    set_request(Request { cli, config, print_only: args.flag("--print-tuning") });
+    let env = Overrides::from_lookup(|k| std::env::var(k).ok());
+    set_request(Request { cli, env, config, host: export_host::probe(), print_only: args.flag("--print-tuning") });
     Ok(())
 }
 

@@ -1122,13 +1122,12 @@ fn export_cache(mb: usize) -> Option<effectcraft_render::LayerCache> {
 
 /// Resolve the export options for `job` (CLI > environment > config > auto, see [`crate::tuning`]).
 fn resolve_tuning(job: &Job, project: &Project) -> crate::tuning::ExportTuning {
-    use crate::tuning::{Overrides, Source, request, resolve};
-    let hw = crate::hw::detect(job.accel);
-    let frame = project.comp(job.comp).map(|c| crate::output_size(c, job.settings, job.output)).unwrap_or((1920, 1080));
+    use crate::tuning::{Source, request, resolve};
     let req = request();
-    let env = Overrides::from_env();
+    let hw = crate::hw::detect(job.accel, &req.host);
+    let frame = project.comp(job.comp).map(|c| crate::output_size(c, job.settings, job.output)).unwrap_or((1920, 1080));
     let cfg = req.config.clone().unwrap_or_default();
-    resolve(&hw, frame, [(&req.cli, Source::Cli), (&env, Source::Env), (&cfg, Source::Config)])
+    resolve(&hw, frame, [(&req.cli, Source::Cli), (&req.env, Source::Env), (&cfg, Source::Config)])
 }
 
 /// Device-side H.264 input for a GPU worker ([`Cx::stream`]): the accelerator renders the frame,
