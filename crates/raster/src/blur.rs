@@ -271,6 +271,37 @@ mod tests {
         }
     }
 
+    /// A transparent-edge blur on a crop of a larger buffer gives the larger buffer's pixels
+    /// within the blur's reach of the content when the crop keeps a second reach of margin on
+    /// the right and bottom (the running sums read ahead into their residue there).
+    #[test]
+    fn crop_with_read_ahead_margin_matches_the_larger_buffer() {
+        let (w, h) = (700usize, 760usize);
+        let mut big = Image::new(w as u32, h as u32);
+        let (x0, x1, y0, y1) = (250usize, 330usize, 300usize, 380usize);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                let v = ((x * 7 + y * 13) % 17) as f32 / 17.0;
+                big.set(x as u32, y as u32, [v * 0.3, v * 0.7, v, 1.0]);
+            }
+        }
+        let (r, it) = (40usize, 3usize);
+        let reach = r * it + 1;
+        let (cx, cy) = (x0 - reach, y0 - reach);
+        let (sw, sh) = (x1 + 2 * reach - cx, y1 + 2 * reach - cy);
+        let mut crop = Image::new(sw as u32, sh as u32);
+        for y in 0..sh {
+            crop.data[y * sw..(y + 1) * sw].copy_from_slice(&big.data[(y + cy) * w + cx..(y + cy) * w + cx + sw]);
+        }
+        let a = box_blur(&big, r, r, it, true);
+        let b = box_blur_phased(&crop, r, r, it, false, cy as i64);
+        for y in 0..sh - reach {
+            for x in 0..sw - reach {
+                assert_eq!(a.data[(y + cy) * w + x + cx].map(f32::to_bits), b.data[y * sw + x].map(f32::to_bits), "{x},{y}");
+            }
+        }
+    }
+
     #[test]
     fn gaussian_preserves_mass() {
         let mut img = Image::new(64, 64);

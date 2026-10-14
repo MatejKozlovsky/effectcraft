@@ -43,16 +43,21 @@ fn gaussian(ctx: &EffectCtx, mut b: Buf) -> Buf {
     }
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
     let mut repeat = ctx.params.b("repeatEdge");
+    let mut far = (0, 0);
     if !repeat && !ctx.adjustment {
         b.pad((s * 3.0).ceil() as u32);
     } else if repeat && !ctx.adjustment {
         // The edge it repeats is the layer's, not the painted content's (#1205).
-        repeat = !b.repeat_as_transparent((s * kx.max(ky) * 3.0).ceil() as u32 + 2);
-        if repeat {
-            cover_for_repeat(ctx, &mut b);
+        match b.repeat_as_transparent((s * kx.max(ky) * 3.0).ceil() as u32 + 2) {
+            Some(m) => {
+                far = m;
+                repeat = false;
+            }
+            None => cover_for_repeat(ctx, &mut b),
         }
     }
     b.img = effectcraft_raster::gaussian_blur_phased(&b.img, s * kx, s * ky, repeat || ctx.adjustment, crate::stack::row_phase());
+    b.crop_far(far);
     b
 }
 
@@ -64,16 +69,21 @@ fn box_blur(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let it = ctx.params.f("iterations").round().clamp(1.0, 50.0) as usize;
     let (kx, ky) = dims_xy(ctx.params.e("dimensions"));
     let mut repeat = ctx.params.b("repeatEdge");
+    let mut far = (0, 0);
     if !repeat && !ctx.adjustment {
         b.pad((r * it) as u32 + 1);
     } else if repeat && !ctx.adjustment {
         // The edge it repeats is the layer's, not the painted content's (#1205).
-        repeat = !b.repeat_as_transparent((r * it * (kx.max(ky) as usize)) as u32 + 1);
-        if repeat {
-            cover_for_repeat(ctx, &mut b);
+        match b.repeat_as_transparent((r * it * (kx.max(ky) as usize)) as u32 + 1) {
+            Some(m) => {
+                far = m;
+                repeat = false;
+            }
+            None => cover_for_repeat(ctx, &mut b),
         }
     }
     b.img = effectcraft_raster::box_blur_phased(&b.img, r * kx as usize, r * ky as usize, it, repeat || ctx.adjustment, crate::stack::row_phase());
+    b.crop_far(far);
     b
 }
 

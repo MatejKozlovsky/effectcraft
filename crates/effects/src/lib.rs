@@ -348,11 +348,16 @@ impl Buf {
     /// `spread` (its reach), clamped to the covered buffer: same sums, same pixels. The covered
     /// buffer holds nothing outside this one. False (use [`Buf::grow_to_main`]) when its edge has
     /// content or nothing is tracked.
-    pub fn repeat_as_transparent(&mut self, spread: u32) -> bool {
-        let Some([x, y, w, h]) = stack::main_rect() else { return false };
+    ///
+    /// Running sums leave rounding residue to the right of and below the content all the way to
+    /// the covered buffer's edge, and each pass reads `r + 1` ahead into it, so the right and
+    /// bottom sides get a second `spread` of margin; the returned `(right, bottom)` extra is
+    /// cropped off after the blur ([`Buf::crop_far`]), keeping every pixel within `spread` exact.
+    pub fn repeat_as_transparent(&mut self, spread: u32) -> Option<(u32, u32)> {
+        let [x, y, w, h] = stack::main_rect()?;
         let (bw, bh) = (self.img.width as i64, self.img.height as i64);
         if bw == 0 || bh == 0 || x > 0 || y > 0 || x + w < bw || y + h < bh {
-            return false;
+            return None;
         }
         let (iw, ih) = (bw as usize, bh as usize);
         let d = &self.img.data;
@@ -363,14 +368,29 @@ impl Buf {
             || (y == 0 && !d[..iw].iter().all(clear))
             || (y + h == bh && !d[(ih - 1) * iw..].iter().all(clear))
         {
-            return false;
+            return None;
         }
         let s = spread as i64;
-        let (l, t, r, b) = (s.min(-x), s.min(-y), s.min(x + w - bw), s.min(y + h - bh));
+        let (l, t) = (s.min(-x), s.min(-y));
+        let (r, b) = ((2 * s).min(x + w - bw), (2 * s).min(y + h - bh));
         self.grow_sides(l as u32, t as u32, r as u32, b as u32);
         stack::shift_row_phase(t);
         stack::set_main_rect(Some([x + l, y + t, w, h]));
-        true
+        Some(((r - s.min(r)) as u32, (b - s.min(b)) as u32))
+    }
+    /// Drop `right` columns and `bottom` rows (the read-ahead margin of
+    /// [`Buf::repeat_as_transparent`]).
+    pub fn crop_far(&mut self, (right, bottom): (u32, u32)) {
+        if right == 0 && bottom == 0 {
+            return;
+        }
+        let (w, h) = (self.img.width as usize, self.img.height as usize);
+        let (nw, nh) = (w - right as usize, h - bottom as usize);
+        let mut out = Image::new(nw as u32, nh as u32);
+        for (y, row) in out.data.chunks_mut(nw.max(1)).enumerate().take(nh) {
+            row.copy_from_slice(&self.img.data[y * w..y * w + nw]);
+        }
+        self.img = out;
     }
     /// Repeat Edge Pixels on an aligned buffer: grow to the covered buffer ([`stack::main_rect`])
     /// so the repeated edge pixels are the same; false when it is not tracked.
