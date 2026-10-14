@@ -341,6 +341,9 @@ pub struct GpuContext {
     dummy_tex: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
     uploads: Mutex<Uploads>,
+    /// Keep effect-chain results on the device for the compositor (`EFFECTCRAFT_NO_HANDOFF=1`
+    /// turns it off; read once).
+    pub(crate) handoff: bool,
     upload_budget: std::sync::atomic::AtomicUsize,
     upload_full_warned: std::sync::atomic::AtomicBool,
     pool: Arc<Mutex<Pool>>,
@@ -692,6 +695,7 @@ impl GpuContext {
             dummy,
             dummy_buf,
             uploads: Mutex::new(Uploads::default()),
+            handoff: std::env::var_os("EFFECTCRAFT_NO_HANDOFF").is_none(),
             upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_full_warned: Default::default(),
             pool: Arc::new(Mutex::new(pool)),
@@ -982,6 +986,20 @@ impl GpuContext {
             }
         }
         let img = self.upload_image(&buf.img)?;
+        self.remember_upload(buf, img.clone());
+        Some(img)
+    }
+
+    /// `img` holds `buf`'s pixels on the device (an effect chain's result, read back into `buf`):
+    /// later [`upload_buf`](Self::upload_buf)s of this `Arc` use it instead of uploading again.
+    pub(crate) fn adopt_upload(&self, buf: &Arc<Buf>, img: GpuImage) {
+        if (img.width, img.height) == (buf.img.width, buf.img.height) {
+            self.remember_upload(buf, img);
+        }
+    }
+
+    fn remember_upload(&self, buf: &Arc<Buf>, img: GpuImage) {
+        let key = Arc::as_ptr(buf) as usize;
         if let Ok(mut u) = self.uploads.lock() {
             let bytes = buf.img.data.len() * 16;
             let now = u.clock;
@@ -1013,7 +1031,6 @@ impl GpuContext {
                 }
             }
         }
-        Some(img)
     }
 
     /// Forget uploaded layer textures.
