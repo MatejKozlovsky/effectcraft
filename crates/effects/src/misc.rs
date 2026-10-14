@@ -31,9 +31,9 @@ fn cover_for_repeat(ctx: &EffectCtx, b: &mut Buf) {
     if b.grow_to_main() {
         return;
     }
-    let dy = crate::cover_plan(b.offset, b.scale, ctx.layer_size, b.img.width, b.img.height).map_or(0, |p| p.1);
+    // Untracked (a covered stack, or an accelerator chain ran): the covered buffer is this one.
     b.cover(ctx.layer_size);
-    crate::stack::shift_row_phase(dy as i64);
+    crate::stack::set_row_phase(0);
 }
 
 fn gaussian(ctx: &EffectCtx, mut b: Buf) -> Buf {

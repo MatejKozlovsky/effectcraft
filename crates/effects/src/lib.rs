@@ -342,32 +342,40 @@ impl Buf {
         self.offset[0] += l as f64;
         self.offset[1] += t as f64;
     }
-    /// Repeat Edge Pixels on an aligned buffer, cheap case: when every edge pixel of the covered
-    /// buffer ([`stack::main_rect`]) is transparent, repeating it equals extending with
-    /// transparent pixels, so the blur runs without Repeat Edge on this buffer grown by only
-    /// `spread` (its reach), clamped to the covered buffer: same sums, same pixels. The covered
-    /// buffer holds nothing outside this one. False (use [`Buf::grow_to_main`]) when its edge has
-    /// content or nothing is tracked.
+    /// Repeat Edge Pixels on an aligned buffer, cheap case: when every pixel of the covered
+    /// buffer ([`stack::main_rect`]) within `spread` (the blur's whole reach, all passes) of its
+    /// edges is transparent, its edge pixels stay transparent through every pass, so repeating
+    /// them equals extending with transparent pixels. The blur then runs without Repeat Edge on
+    /// this buffer grown by only `spread`, clamped to the covered buffer: same sums, same pixels.
+    /// The covered buffer holds nothing outside this one. A transparent edge alone is not enough:
+    /// after the first pass the edge holds blurred content, which later passes repeat. False (use
+    /// [`Buf::grow_to_main`]) when content is that close to the edge, nothing is tracked, or a
+    /// later effect follows in the stack ([`stack::followed`]): the cropped buffer drops the
+    /// covered buffer's rounding residue, which a later blur or displacement would read.
     ///
     /// Running sums leave rounding residue to the right of and below the content all the way to
     /// the covered buffer's edge, and each pass reads `r + 1` ahead into it, so the right and
     /// bottom sides get a second `spread` of margin; the returned `(right, bottom)` extra is
     /// cropped off after the blur ([`Buf::crop_far`]), keeping every pixel within `spread` exact.
     pub fn repeat_as_transparent(&mut self, spread: u32) -> Option<(u32, u32)> {
+        if stack::followed() {
+            return None;
+        }
         let [x, y, w, h] = stack::main_rect()?;
         let (bw, bh) = (self.img.width as i64, self.img.height as i64);
         if bw == 0 || bh == 0 || x > 0 || y > 0 || x + w < bw || y + h < bh {
             return None;
         }
-        let (iw, ih) = (bw as usize, bh as usize);
+        let s = spread as i64;
+        let iw = bw as usize;
         let d = &self.img.data;
         let clear = |p: &[f32; 4]| p.iter().all(|v| *v == 0.0);
-        // Sides where the covered buffer's edge is ours: those pixels must be transparent.
-        if (x == 0 && !(0..ih).all(|r| clear(&d[r * iw])))
-            || (x + w == bw && !(0..ih).all(|r| clear(&d[r * iw + iw - 1])))
-            || (y == 0 && !d[..iw].iter().all(clear))
-            || (y + h == bh && !d[(ih - 1) * iw..].iter().all(clear))
-        {
+        // Bands of this buffer within `spread` of each covered-buffer edge must be transparent.
+        let (xl, xr) = ((x + s).clamp(0, bw) as usize, (x + w - s).clamp(0, bw) as usize);
+        let (yt, yb) = ((y + s).clamp(0, bh) as usize, (y + h - s).clamp(0, bh) as usize);
+        let rows_clear = |r0: usize, r1: usize| d[r0 * iw..r1 * iw].iter().all(clear);
+        let cols_clear = |c0: usize, c1: usize| c0 >= c1 || (0..bh as usize).all(|r| d[r * iw + c0..r * iw + c1].iter().all(clear));
+        if !rows_clear(0, yt) || !rows_clear(yb.max(yt), bh as usize) || !cols_clear(0, xl) || !cols_clear(xr.max(xl), iw) {
             return None;
         }
         let s = spread as i64;

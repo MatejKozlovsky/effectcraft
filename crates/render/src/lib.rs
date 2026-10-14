@@ -1224,6 +1224,8 @@ impl<'a> Renderer<'a> {
                     .collect();
                 let t0 = web_time::Instant::now();
                 if target.gpu(&steps) {
+                    // The accelerator grew the buffer without the CPU blurs' tracking.
+                    effectcraft_effects::stack::forget();
                     if let Some(v) = timing.as_deref_mut() {
                         let ms = t0.elapsed().as_secs_f64() * 1e3 / run.len() as f64;
                         v.extend(run.iter().map(|(_, _, s)| (format!("{} (gpu)", s.id), ms)));
@@ -1237,6 +1239,7 @@ impl<'a> Renderer<'a> {
             host.index.store(i, std::sync::atomic::Ordering::Relaxed);
             let env = EffectEnv { effect_index: i, ..env };
             let ectx = EffectCtx { params: &params, time: lt.seconds(), layer_size, seed: g.uid as u32, adjustment, env };
+            effectcraft_effects::stack::set_followed(k < stack.len());
             let t0 = web_time::Instant::now();
             target.cpu(&mut |buf| {
                 let mut buf = effectcraft_effects::apply(spec, &ectx, buf);
