@@ -342,6 +342,36 @@ impl Buf {
         self.offset[0] += l as f64;
         self.offset[1] += t as f64;
     }
+    /// Repeat Edge Pixels on an aligned buffer, cheap case: when every edge pixel of the covered
+    /// buffer ([`stack::main_rect`]) is transparent, repeating it equals extending with
+    /// transparent pixels, so the blur runs without Repeat Edge on this buffer grown by only
+    /// `spread` (its reach), clamped to the covered buffer: same sums, same pixels. The covered
+    /// buffer holds nothing outside this one. False (use [`Buf::grow_to_main`]) when its edge has
+    /// content or nothing is tracked.
+    pub fn repeat_as_transparent(&mut self, spread: u32) -> bool {
+        let Some([x, y, w, h]) = stack::main_rect() else { return false };
+        let (bw, bh) = (self.img.width as i64, self.img.height as i64);
+        if bw == 0 || bh == 0 || x > 0 || y > 0 || x + w < bw || y + h < bh {
+            return false;
+        }
+        let (iw, ih) = (bw as usize, bh as usize);
+        let d = &self.img.data;
+        let clear = |p: &[f32; 4]| p.iter().all(|v| *v == 0.0);
+        // Sides where the covered buffer's edge is ours: those pixels must be transparent.
+        if (x == 0 && !(0..ih).all(|r| clear(&d[r * iw])))
+            || (x + w == bw && !(0..ih).all(|r| clear(&d[r * iw + iw - 1])))
+            || (y == 0 && !d[..iw].iter().all(clear))
+            || (y + h == bh && !d[(ih - 1) * iw..].iter().all(clear))
+        {
+            return false;
+        }
+        let s = spread as i64;
+        let (l, t, r, b) = (s.min(-x), s.min(-y), s.min(x + w - bw), s.min(y + h - bh));
+        self.grow_sides(l as u32, t as u32, r as u32, b as u32);
+        stack::shift_row_phase(t);
+        stack::set_main_rect(Some([x + l, y + t, w, h]));
+        true
+    }
     /// Repeat Edge Pixels on an aligned buffer: grow to the covered buffer ([`stack::main_rect`])
     /// so the repeated edge pixels are the same; false when it is not tracked.
     pub fn grow_to_main(&mut self) -> bool {
