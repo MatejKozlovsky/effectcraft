@@ -403,6 +403,43 @@ fn cached_frames_match_uncached() {
     assert!(st.hits >= 10, "{st:?}");
 }
 
+/// `--exp-input-cache` (reuse-only admission) renders the same pixels; an expression-driven
+/// effect and a time-dependent effect re-render every frame, static layers are still reused.
+#[test]
+fn reuse_only_cache_matches_uncached_with_expressions_and_time_effects() {
+    let (mut p, cid) = cache_scene();
+    let c = p.comp(cid).unwrap().clone();
+    let mut wavy = solid(&mut p, &c, [0.9, 0.2, 0.1], 200, 100);
+    add_effect_200(&mut p, &mut wavy, "ec.distort.wavewarp", &[]);
+    let mut expr = solid(&mut p, &c, [0.1, 0.8, 0.3], 200, 100);
+    add_effect_200(&mut p, &mut expr, "ec.color.tint", &[]);
+    expr.props.prop_mut("effects/#1/amount").unwrap().expr = Some(effectcraft_project::Expression { text: "time * 60".into(), enabled: true });
+    for l in [&mut wavy, &mut expr] {
+        l.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(50.0);
+    }
+    let comp = p.comp_mut(cid).unwrap();
+    comp.layers.insert(0, expr);
+    comp.layers.insert(0, wavy);
+    let cache = crate::LayerCache::default();
+    cache.set_reuse_only(true);
+    let mut prev: Option<crate::Image> = None;
+    for f in [0.0, 0.25, 0.5, 0.75, 1.2, 1.5] {
+        let t = Tick::from_seconds_f64(f);
+        let cached = render_cached(&p, cid, t, Some(&cache));
+        let fresh = render_cached(&p, cid, t, None);
+        assert!(cached.data == fresh.data, "t={f}: not byte-identical to the uncached render");
+        if let Some(pv) = &prev {
+            assert!(pv.data != cached.data, "t={f}: the time effect / expression did not advance");
+        }
+        prev = Some(cached);
+    }
+    let again = render_cached(&p, cid, Tick::from_seconds_f64(0.25), Some(&cache));
+    assert!(again.data == render_cached(&p, cid, Tick::from_seconds_f64(0.25), None).data, "revisited frame");
+    let (st, n) = (cache.stats(), cache.counts());
+    // Within the budget everything is kept at once, as by the plain cache.
+    assert!(st.hits >= 8 && n.rejected == 0, "{st:?} {n:?}");
+}
+
 #[test]
 fn static_and_transform_only_layers_are_reused() {
     let (p, cid) = cache_scene();
