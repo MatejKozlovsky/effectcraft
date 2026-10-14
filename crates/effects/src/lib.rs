@@ -54,6 +54,7 @@ pub mod roto;
 mod sim;
 mod sim2;
 mod sim3;
+pub mod stack;
 mod stylize2;
 mod stylize3;
 mod textfx;
@@ -307,10 +308,19 @@ impl Buf {
     /// `size` would, by growing left/top only ([`align_plan`]). A downscaled layer is resampled
     /// through a pyramid whose 2x2 blocks follow the buffer's grid, so a buffer that starts at
     /// its content's corner instead of the cover's resamples to different pixels (#1205).
+    ///
+    /// Records how many rows the cover would have added on top beyond these
+    /// ([`stack::row_phase`]), so CPU blurs round as on the covered buffer.
     pub fn align(&mut self, size: [f64; 2]) {
-        if let Some((l, t)) = align_plan(self.offset, self.scale, size, self.img.width, self.img.height) {
-            self.grow_left_top(l, t);
-        }
+        let dy = cover_plan(self.offset, self.scale, size, self.img.width, self.img.height).map_or(0, |p| p.1 as i64);
+        let t = match align_plan(self.offset, self.scale, size, self.img.width, self.img.height) {
+            Some((l, t)) => {
+                self.grow_left_top(l, t);
+                t as i64
+            }
+            None => 0,
+        };
+        stack::set_row_phase(dy - t);
     }
     /// Grow by `pad` transparent pixels on every side.
     pub fn pad(&mut self, pad: u32) {

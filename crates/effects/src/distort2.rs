@@ -95,7 +95,9 @@ fn turbulent_displace(ctx: &EffectCtx, mut b: Buf) -> Buf {
         b.pad(amount.abs().ceil() as u32 + 1);
     } else {
         // Room for pixels displaced past the content, up to the layer's edge (#1205).
-        b.pad(crate::cover_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale, amount.abs().ceil() as u32 + 1));
+        let p = crate::cover_pad(ctx, [b.img.width, b.img.height], b.offset, b.scale, amount.abs().ceil() as u32 + 1);
+        b.pad(p);
+        crate::stack::shift_row_phase(p as i64);
     }
     let off = b.to_px(ctx.params.v2("offset"));
     let oct = ctx.params.f("complexity").clamp(1.0, 10.0);

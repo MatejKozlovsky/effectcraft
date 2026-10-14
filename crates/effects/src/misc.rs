@@ -25,6 +25,13 @@ fn dims_xy(dim: u32) -> (f64, f64) {
     }
 }
 
+/// Repeat Edge Pixels: the edge it repeats is the layer rectangle's ([`Buf::cover`]).
+fn cover_for_repeat(ctx: &EffectCtx, b: &mut Buf) {
+    let dy = crate::cover_plan(b.offset, b.scale, ctx.layer_size, b.img.width, b.img.height).map_or(0, |p| p.1);
+    b.cover(ctx.layer_size);
+    crate::stack::shift_row_phase(dy as i64);
+}
+
 fn gaussian(ctx: &EffectCtx, mut b: Buf) -> Buf {
     let s = blur_sigma(ctx.params.f("blurriness")) * b.scale;
     if s <= 0.0 {
@@ -36,9 +43,9 @@ fn gaussian(ctx: &EffectCtx, mut b: Buf) -> Buf {
         b.pad((s * 3.0).ceil() as u32);
     } else if repeat && !ctx.adjustment {
         // The edge it repeats is the layer's, not the painted content's (#1205).
-        b.cover(ctx.layer_size);
+        cover_for_repeat(ctx, &mut b);
     }
-    b.img = gaussian_blur(&b.img, s * kx, s * ky, repeat || ctx.adjustment);
+    b.img = effectcraft_raster::gaussian_blur_phased(&b.img, s * kx, s * ky, repeat || ctx.adjustment, crate::stack::row_phase());
     b
 }
 
@@ -54,9 +61,9 @@ fn box_blur(ctx: &EffectCtx, mut b: Buf) -> Buf {
         b.pad((r * it) as u32 + 1);
     } else if repeat && !ctx.adjustment {
         // The edge it repeats is the layer's, not the painted content's (#1205).
-        b.cover(ctx.layer_size);
+        cover_for_repeat(ctx, &mut b);
     }
-    b.img = effectcraft_raster::box_blur(&b.img, r * kx as usize, r * ky as usize, it, repeat || ctx.adjustment);
+    b.img = effectcraft_raster::box_blur_phased(&b.img, r * kx as usize, r * ky as usize, it, repeat || ctx.adjustment, crate::stack::row_phase());
     b
 }
 
@@ -202,7 +209,7 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         }
     });
     let s = (radius / 2.0).max(0.5);
-    let blurred = gaussian_blur(&bright, s * kx, s * ky, false);
+    let blurred = effectcraft_raster::gaussian_blur_phased(&bright, s * kx, s * ky, false, crate::stack::row_phase());
     let mode = ctx.params.e("operation");
     b.img.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(o, g)| {
         let g = g.map(|v| v * intensity);

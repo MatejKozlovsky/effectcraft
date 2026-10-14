@@ -1138,6 +1138,8 @@ impl<'a> Renderer<'a> {
             return;
         }
         let Some(fx) = layer.effects() else { return };
+        // This stack's buffer placement for CPU blurs (effectcraft_effects::stack).
+        let _stack = effectcraft_effects::stack::StackScope::new();
         let lt = layer.layer_time(ctx.time);
         let layer_size = ctx.effect_bounds(layer).0;
         // #659 / #1205: an authored layer's buffer spans only its painted content. Effects that
