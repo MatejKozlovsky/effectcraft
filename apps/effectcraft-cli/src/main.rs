@@ -278,7 +278,9 @@ fn main() {
         Ok(a) => a,
         Err(e) => fail_usage(&e),
     };
-    if args.flag("--exp-input-cache") {
+    if args.flag("--exp-input-cache")
+        || std::env::var("EFFECTCRAFT_EXP_INPUT_CACHE").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
+    {
         effectcraft_render::cache::set_input_cache(true);
     }
     let json_out = args.flag("--json");

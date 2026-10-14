@@ -26,15 +26,14 @@ use effectcraft_effects::Buf;
 /// `--exp-input-cache`: new caches admit only results rendered again ([`set_input_cache`]).
 static INPUT_CACHE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
-/// Make caches created from now on reuse-only (the CLI's `--exp-input-cache`; also
-/// `EFFECTCRAFT_EXP_INPUT_CACHE=1`). Off by default.
+/// Make caches created from now on reuse-only (the CLI's `--exp-input-cache` or
+/// `EFFECTCRAFT_EXP_INPUT_CACHE=1`, read by the CLI). Off by default.
 pub fn set_input_cache(on: bool) {
     INPUT_CACHE.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
 fn input_cache() -> bool {
     INPUT_CACHE.load(std::sync::atomic::Ordering::Relaxed)
-        || std::env::var("EFFECTCRAFT_EXP_INPUT_CACHE").is_ok_and(|v| matches!(v.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on" | "yes"))
 }
 use effectcraft_project::{ItemKind, Layer, LayerSource, Node, PropGroup};
 
@@ -59,8 +58,8 @@ struct Entry {
     buf: Arc<Buf>,
     bytes: usize,
     last_use: u64,
-    /// `--exp-input-cache` crop: the full buffer's size and the crop origin within it.
-    full: Option<(u32, u32, i64, i64)>,
+    /// `--exp-input-cache` crop: how to give the full buffer back.
+    full: Option<Crop>,
     /// The full-extent buffer of a cropped entry, kept while the entry is hot (hit within a
     /// cycle) so hits share one `Arc` and one GPU upload instead of a copy and an upload per
     /// frame. Its bytes count in `bytes`; dropped when the entry idles past a cycle.
@@ -96,12 +95,25 @@ pub struct Counts {
     /// Misses of keys the cache held before and evicted.
     pub re_misses: u64,
     pub peak_bytes: usize,
+    /// `--exp-input-cache`: inserts stored cropped.
+    pub cropped: u64,
+}
+
+/// Where a cropped entry came from: the full buffer's size, the crop origin within it and the
+/// full buffer's own offset (restored bit for bit, not recomputed from the crop's).
+#[derive(Clone, Copy, Debug)]
+struct Crop {
+    w: u32,
+    h: u32,
+    x0: i64,
+    y0: i64,
+    offset: [f64; 2],
 }
 
 /// `--exp-input-cache` keeps a layer's pixels cropped to the non-zero ones (plus a margin of
 /// zeros, so sampling at the edge reads the same): full-frame layers with a small subject take
 /// a fraction of the memory. Same pixels at the same place (the offset moves with the crop).
-fn trimmed(buf: Arc<Buf>) -> (Arc<Buf>, Option<(u32, u32, i64, i64)>) {
+fn trimmed(buf: Arc<Buf>) -> (Arc<Buf>, Option<Crop>) {
     let img = &buf.img;
     let (w, h) = (img.width as usize, img.height as usize);
     if w == 0 || h == 0 || img.data.len() != w * h {
@@ -126,17 +138,20 @@ fn trimmed(buf: Arc<Buf>) -> (Arc<Buf>, Option<(u32, u32, i64, i64)>) {
     let mut out = (*buf).clone();
     out.img = img.crop(x0 as i64, y0 as i64, (x1 - x0) as u32, (y1 - y0) as u32);
     out.offset = [buf.offset[0] - x0 as f64, buf.offset[1] - y0 as f64];
-    (Arc::new(out), Some((w as u32, h as u32, x0 as i64, y0 as i64)))
+    let crop = Crop { w: w as u32, h: h as u32, x0: x0 as i64, y0: y0 as i64, offset: buf.offset };
+    (Arc::new(out), Some(crop))
 }
 
 /// A cropped entry handed back at its full extent and origin: compositing a smaller buffer at a
 /// shifted offset rounds sample positions differently (1-2 levels in 8 bpc), so a hit must be
 /// the very buffer that was rendered.
-fn untrimmed(buf: Arc<Buf>, full: Option<(u32, u32, i64, i64)>) -> Arc<Buf> {
-    let Some((w, h, x0, y0)) = full else { return buf };
+fn untrimmed(buf: Arc<Buf>, full: Option<Crop>) -> Arc<Buf> {
+    let Some(c) = full else { return buf };
     let mut out = (*buf).clone();
-    out.img = buf.img.crop(-x0, -y0, w, h);
-    out.offset = [buf.offset[0] + x0 as f64, buf.offset[1] + y0 as f64];
+    out.img = buf.img.crop(-c.x0, -c.y0, c.w, c.h);
+    // The original offset, not `offset - x0 + x0`: that can round a fractional offset (or turn
+    // -0.0 into 0.0) and move the layer's samples.
+    out.offset = c.offset;
     Arc::new(out)
 }
 
@@ -275,7 +290,7 @@ impl LayerCache {
                 if now % 1024 == 0 {
                     // Drop expansions of entries idle for longer than a cycle.
                     let window = 2 * g.map.len() as u64 + 16;
-                    Self::drop_expansions(&mut g, |idle| idle > window, key);
+                    Self::drop_expansions(&mut g, |idle| idle > window, key, None);
                 }
                 if full.is_none() {
                     return Some(b);
@@ -290,7 +305,7 @@ impl LayerCache {
                     // Keep the copy only within the budget: first drop other entries' idle
                     // copies, then go without (this hit copies again next time).
                     if g.bytes + xb > g.budget {
-                        Self::drop_expansions(&mut g, |_| true, key);
+                        Self::drop_expansions(&mut g, |_| true, key, Some(xb));
                     }
                     if g.bytes + xb <= g.budget
                         && let Some(e) = g.map.get_mut(&key)
@@ -337,16 +352,15 @@ impl LayerCache {
     }
 
     /// Drop the full-extent copies of entries (other than `keep`) whose idle time passes
-    /// `idle_ok`, least recently used first, until within the budget (all of them when the
-    /// filter is an idle threshold: the caller wants every idle copy gone).
-    fn drop_expansions(g: &mut Inner, idle_ok: impl Fn(u64) -> bool, keep: u64) {
+    /// `idle_ok`, least recently used first: with `room = Some(n)` until `n` more bytes fit the
+    /// budget, with `None` all of them.
+    fn drop_expansions(g: &mut Inner, idle_ok: impl Fn(u64) -> bool, keep: u64, room: Option<usize>) {
         let now = g.clock;
         let mut v: Vec<(u64, u64)> =
             g.map.iter().filter(|(k, e)| **k != keep && e.expanded.is_some() && idle_ok(now - e.last_use)).map(|(k, e)| (e.last_use, *k)).collect();
         v.sort_unstable();
-        let to_budget = idle_ok(0);
         for (_, k) in v {
-            if to_budget && g.bytes <= g.budget {
+            if room.is_some_and(|n| g.bytes + n <= g.budget) {
                 break;
             }
             if let Some(e) = g.map.get_mut(&k)
@@ -366,12 +380,14 @@ impl LayerCache {
         // second render to be admitted, no crop scan, no full-extent copy on every hit).
         let pressed = self.inner.lock().map(|g| g.reuse_only && g.bytes + raw > g.budget).unwrap_or(false);
         let (buf, full) = if pressed { trimmed(buf) } else { (buf, None) };
+        let cropped = full.is_some();
         let bytes = buf.img.data.len() * std::mem::size_of::<effectcraft_raster::Px>();
         let Ok(mut g) = self.inner.lock() else { return };
         if bytes > g.budget / 4 {
             return;
         }
         g.counts.inserts += 1;
+        g.counts.cropped += cropped as u64;
         // `--exp-input-cache` over budget: admit a key the second time it is rendered (seen =
         // reused). A one-off result (a new key every frame) then never pushes reused ones out.
         if pressed && g.reuse_only && !g.map.contains_key(&key) {
@@ -392,7 +408,7 @@ impl LayerCache {
         }
         g.bytes += bytes;
         if g.bytes > g.budget && g.reuse_only {
-            Self::drop_expansions(&mut g, |_| true, key);
+            Self::drop_expansions(&mut g, |_| true, key, Some(0));
         }
         if g.bytes > g.budget && g.reuse_only {
             // `--exp-input-cache`: a frame's reused entries come round once per frame (a cycle).
@@ -932,6 +948,42 @@ mod reuse_tests {
     /// The Singularity pattern: reused (static) entries plus new one-off keys every frame
     /// (animated layers) over budget. Plain LRU evicts the reused ones every frame (they come
     /// back as misses); reuse-only keeps them.
+    #[test]
+    fn cropped_entries_come_back_bit_for_bit_with_fractional_offsets() {
+        let full = |ox: f64, oy: f64, seed: f32| {
+            let mut img = effectcraft_raster::Image::new(64, 48);
+            for y in 20..30 {
+                for x in 30..41 {
+                    img.data[y * 64 + x] = [seed * x as f32 / 7.0, 0.1 + y as f32 / 97.0, 0.3, 0.75];
+                }
+            }
+            Arc::new(Buf { img, offset: [ox, oy], scale: 1.0 })
+        };
+        let cases = [(-3.25, 7.1), (0.1, -0.0), (-0.0, 0.3), (1e-9 - 40.0, 12345.678)];
+        let bytes = 64 * 48 * std::mem::size_of::<effectcraft_raster::Px>();
+        // Room for four full buffers (an entry may take a quarter of the budget): the rest
+        // arrives under pressure and is cropped.
+        let budget = bytes * 4 + bytes / 2;
+        let c = LayerCache::new(budget);
+        c.set_reuse_only(true);
+        for k in 0..4u64 {
+            c.insert(100 + k, full(0.0, 0.0, 1.0));
+        }
+        for (k, &(ox, oy)) in cases.iter().enumerate() {
+            let src = full(ox, oy, 1.0 + k as f32);
+            c.insert(k as u64, src.clone());
+            c.insert(k as u64, src.clone());
+            for _ in 0..2 {
+                let got = c.get(k as u64).expect("admitted on reuse");
+                assert_eq!((got.img.width, got.img.height), (64, 48));
+                assert!(got.img.data == src.img.data, "case {k}: pixels");
+                assert_eq!(got.offset.map(f64::to_bits), src.offset.map(f64::to_bits), "case {k}: offset");
+            }
+        }
+        assert!(c.counts().cropped >= cases.len() as u64, "{:?}", c.counts());
+        assert!(c.stats().bytes <= budget);
+    }
+
     #[test]
     fn one_off_keys_do_not_evict_reused_entries() {
         let px = 1024;

@@ -440,6 +440,37 @@ fn reuse_only_cache_matches_uncached_with_expressions_and_time_effects() {
     assert!(st.hits >= 8 && n.rejected == 0, "{st:?} {n:?}");
 }
 
+/// `--exp-input-cache` under memory pressure: small subjects at fractional positions in full-comp
+/// layer buffers are stored cropped and handed back at their full extent, byte-identical.
+#[test]
+fn reuse_only_cache_under_pressure_crops_and_matches_uncached() {
+    let (mut p, cid) = cache_scene();
+    let c = p.comp(cid).unwrap().clone();
+    // Static full-comp solids masked down to a small patch at a fractional position, with an
+    // effect: the layer buffer keeps the full extent, mostly transparent.
+    for (i, pos) in [[30.25, 20.5], [140.75, 61.125], [77.5, 33.333], [22.0625, 70.9], [170.4, 25.75], [101.5, 70.25]].into_iter().enumerate() {
+        let mut l = solid(&mut p, &c, [0.9, 0.3 + i as f32 * 0.1, 0.2], 200, 100);
+        let mut next = p.next_id;
+        let m = build::mask(&mut Ids(&mut next), "Patch", ShapePath::rect(pos, 17.5, 13.25), MaskMode::Add, [255, 255, 0]);
+        p.next_id = next;
+        l.props.sub_mut("masks").unwrap().children.push(m.into());
+        add_effect_200(&mut p, &mut l, "ec.channel.invert", &[]);
+        l.props.prop_mut("transform/opacity").unwrap().value = Value::Scalar(70.0);
+        p.comp_mut(cid).unwrap().layers.insert(0, l);
+    }
+    // About four full 200x100 buffers (an entry may take a quarter of the budget): the rest
+    // arrives under pressure.
+    let cache = crate::LayerCache::new(200 * 100 * std::mem::size_of::<effectcraft_raster::Px>() * 4 + 4096);
+    cache.set_reuse_only(true);
+    for f in [0.0, 0.0, 0.25, 0.25, 0.5, 0.0, 0.25, 0.5, 0.5] {
+        let t = Tick::from_seconds_f64(f);
+        let cached = render_cached(&p, cid, t, Some(&cache));
+        assert!(cached.data == render_cached(&p, cid, t, None).data, "t={f}: not byte-identical to the uncached render");
+    }
+    let (st, n) = (cache.stats(), cache.counts());
+    assert!(n.cropped > 0 && st.hits > 0, "{st:?} {n:?}");
+}
+
 #[test]
 fn static_and_transform_only_layers_are_reused() {
     let (p, cid) = cache_scene();
