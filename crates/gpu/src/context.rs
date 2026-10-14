@@ -47,8 +47,12 @@ const POOL_BUDGET: usize = 768 << 20;
 const STAGING_BUDGET: u64 = 256 << 20;
 
 /// Texture bytes an open encoder lets build up before it submits: textures it created since its
-/// last submit, plus textures released (by any encoder) while it was open, which can't be reused
-/// or freed until it is submitted. Without this, a 4K frame of static layers with blurs and glows
+/// last submit, plus (for the oldest open encoder only) textures released while it was open, which
+/// can't be reused or freed until it is submitted. Submitting a newer encoder frees none of those,
+/// so only the oldest reacts to them.
+///
+/// Fixed rather than scaled by adapter memory: wgpu reports no VRAM size. 1 GiB keeps a 4K frame
+/// within an 8 GB (GTX 1070) and a 24 GB (RTX 3090) card without measurable submit overhead. Without this, a 4K frame of static layers with blurs and glows
 /// (each effect run its own `Enc`, the frame's encoder open throughout) parks gigabytes and the
 /// device runs out of memory, which retires the GPU for the rest of the export.
 const PENDING_BYTES: usize = 1 << 30;
@@ -110,8 +114,10 @@ pub(crate) struct Pool {
     free: HashMap<(u32, u32), Vec<wgpu::Texture>>,
     /// (texture, newest encoder open at its release).
     released: Vec<(wgpu::Texture, u64)>,
-    /// Bytes of `released` (an open encoder submits once they pass [`PENDING_BYTES`]).
+    /// Bytes of `released` (the oldest open encoder submits once they pass [`PENDING_BYTES`]).
     released_bytes: usize,
+    /// `released_bytes` and the oldest open encoder, readable without the lock (every dispatch).
+    parked: Arc<Parked>,
     /// Encoders with recorded, unsubmitted work.
     open: BTreeSet<u64>,
     next: u64,
@@ -126,6 +132,22 @@ pub(crate) struct Pool {
     /// working texture of another `Enc` before it is gone.
     owned: HashMap<u64, HashMap<(u32, u32), Vec<wgpu::Texture>>>,
     next_owner: u64,
+}
+
+/// Lock-free view of the pool for [`Enc::dispatch`] (written under the pool lock).
+#[derive(Default)]
+pub(crate) struct Parked {
+    bytes: std::sync::atomic::AtomicUsize,
+    /// Id of the oldest open encoder (0: none).
+    oldest: std::sync::atomic::AtomicU64,
+}
+
+impl Parked {
+    /// Released bytes waiting on encoder `id`'s submit (0 unless it is the oldest open one).
+    fn waiting_on(&self, id: u64) -> usize {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.oldest.load(Relaxed) == id { self.bytes.load(Relaxed) } else { 0 }
+    }
 }
 
 /// In-`Enc` texture reuse ([`Pool::owned`]); tests turn it off to compare.
@@ -168,6 +190,7 @@ impl Pool {
             Some(&newest) => {
                 self.released_bytes += tex_bytes(&t);
                 self.released.push((t, newest));
+                self.publish();
             }
             None => self.make_free(t),
         }
@@ -185,7 +208,14 @@ impl Pool {
     fn open(&mut self) -> u64 {
         self.next += 1;
         self.open.insert(self.next);
+        self.publish();
         self.next
+    }
+
+    fn publish(&self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.parked.bytes.store(self.released_bytes, Relaxed);
+        self.parked.oldest.store(self.open.first().copied().unwrap_or(0), Relaxed);
     }
 
     /// Encoder `id` was submitted or dropped: free what no open encoder can still read.
@@ -193,11 +223,13 @@ impl Pool {
         self.open.remove(&id);
         let oldest = self.open.first().copied().unwrap_or(u64::MAX);
         if self.released.iter().all(|(_, w)| *w >= oldest) {
+            self.publish();
             return;
         }
         let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.released).into_iter().partition(|(_, w)| *w < oldest);
         self.released_bytes = wait.iter().map(|(t, _)| tex_bytes(t)).sum();
         self.released = wait;
+        self.publish();
         for (t, _) in ready {
             self.make_free(t);
         }
@@ -312,6 +344,8 @@ pub struct GpuContext {
     upload_budget: std::sync::atomic::AtomicUsize,
     upload_full_warned: std::sync::atomic::AtomicBool,
     pool: Arc<Mutex<Pool>>,
+    /// The pool's [`Parked`] (shared, lock-free).
+    parked: Arc<Parked>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
     pub(crate) transfers: Transfers,
     /// Readback staging buffers by size.
@@ -640,6 +674,8 @@ impl GpuContext {
             init_resource(&device, "dummy storage buffer", || buffer_init(&device, &queue, Some("dummy"), &[0u8; 16], wgpu::BufferUsages::STORAGE))?;
         let dummy_tex = init_resource(&device, "dummy texture view", || dummy.create_view(&Default::default()))?;
         let max_dim = device.limits().max_texture_dimension_2d;
+        let pool = Pool::default();
+        let parked = pool.parked.clone();
         Ok(GpuContext {
             device,
             queue,
@@ -658,7 +694,8 @@ impl GpuContext {
             uploads: Mutex::new(Uploads::default()),
             upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_full_warned: Default::default(),
-            pool: Default::default(),
+            pool: Arc::new(Mutex::new(pool)),
+            parked,
             staging: Default::default(),
             transfers: Default::default(),
             zeros: Default::default(),
@@ -1159,7 +1196,9 @@ impl<'g> Enc<'g> {
         }
         self.pending += 1;
         // Keep command buffers (and the transient textures they hold) bounded.
-        let parked = self.g.pool.lock().map_or(0, |p| p.released_bytes);
+        // Parked textures wait on the oldest open encoder (usually a frame's), so only its submit
+        // frees them; a newer one (an effect chain inside the frame) counts only its own.
+        let parked = self.enc.as_ref().map_or(0, |(_, id)| self.g.parked.waiting_on(*id));
         if self.pending >= 256 || self.pending_bytes + parked >= PENDING_BYTES {
             self.submit();
         }
