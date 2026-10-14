@@ -46,6 +46,13 @@ const POOL_BUDGET: usize = 768 << 20;
 /// Readback staging buffers kept for reuse across sizes (bytes).
 const STAGING_BUDGET: u64 = 256 << 20;
 
+/// Texture bytes an open encoder lets build up before it submits: textures it created since its
+/// last submit, plus textures released (by any encoder) while it was open, which can't be reused
+/// or freed until it is submitted. Without this, a 4K frame of static layers with blurs and glows
+/// (each effect run its own `Enc`, the frame's encoder open throughout) parks gigabytes and the
+/// device runs out of memory, which retires the GPU for the rest of the export.
+const PENDING_BYTES: usize = 1 << 30;
+
 /// A GPU image: premultiplied RGBA f32 in a texture (cheap to clone; immutable once written).
 /// Working images come from the context's texture pool and go back to it when the last clone
 /// is dropped.
@@ -103,6 +110,8 @@ pub(crate) struct Pool {
     free: HashMap<(u32, u32), Vec<wgpu::Texture>>,
     /// (texture, newest encoder open at its release).
     released: Vec<(wgpu::Texture, u64)>,
+    /// Bytes of `released` (an open encoder submits once they pass [`PENDING_BYTES`]).
+    released_bytes: usize,
     /// Encoders with recorded, unsubmitted work.
     open: BTreeSet<u64>,
     next: u64,
@@ -156,7 +165,10 @@ fn tex_bytes(t: &wgpu::Texture) -> usize {
 impl Pool {
     fn release(&mut self, t: wgpu::Texture) {
         match self.open.last() {
-            Some(&newest) => self.released.push((t, newest)),
+            Some(&newest) => {
+                self.released_bytes += tex_bytes(&t);
+                self.released.push((t, newest));
+            }
             None => self.make_free(t),
         }
     }
@@ -184,6 +196,7 @@ impl Pool {
             return;
         }
         let (ready, wait): (Vec<_>, Vec<_>) = std::mem::take(&mut self.released).into_iter().partition(|(_, w)| *w < oldest);
+        self.released_bytes = wait.iter().map(|(t, _)| tex_bytes(t)).sum();
         self.released = wait;
         for (t, _) in ready {
             self.make_free(t);
@@ -987,6 +1000,8 @@ pub(crate) struct Enc<'g> {
     /// The open command encoder and its id in the texture pool.
     enc: Option<(wgpu::CommandEncoder, u64)>,
     pending: usize,
+    /// Bytes of new textures created since the last submit (see [`PENDING_BYTES`]).
+    pending_bytes: usize,
     /// A dispatch named a kernel the device doesn't have (see [`Enc::take_missing`]).
     missing: bool,
     /// This `Enc`'s id in the texture pool (textures it may reuse at once).
@@ -1008,7 +1023,7 @@ impl Drop for Enc<'_> {
 impl<'g> Enc<'g> {
     pub fn new(g: &'g GpuContext) -> Enc<'g> {
         let owner = g.pool.lock().map(|mut p| p.register()).unwrap_or(0);
-        Enc { g, enc: None, pending: 0, missing: false, owner }
+        Enc { g, enc: None, pending: 0, pending_bytes: 0, missing: false, owner }
     }
 
     /// Whether a dispatch since the last call named a kernel the device doesn't have (one
@@ -1033,6 +1048,8 @@ impl<'g> Enc<'g> {
         let (img, reused) = self.g.pooled(w, h, self.owner);
         if reused {
             self.fill(&img, 0.0);
+        } else {
+            self.pending_bytes += tex_bytes(&img.texture);
         }
         img
     }
@@ -1040,7 +1057,10 @@ impl<'g> Enc<'g> {
     /// A new image for a kernel that writes every pixel of it (pooled; contents undefined).
     /// Under test it starts out as NaNs, so a kernel that skips pixels fails the CPU oracle.
     pub fn scratch(&mut self, w: u32, h: u32) -> GpuImage {
-        let (img, _) = self.g.pooled(w, h, self.owner);
+        let (img, reused) = self.g.pooled(w, h, self.owner);
+        if !reused {
+            self.pending_bytes += tex_bytes(&img.texture);
+        }
         if cfg!(test) {
             self.fill(&img, f32::NAN);
         }
@@ -1139,7 +1159,8 @@ impl<'g> Enc<'g> {
         }
         self.pending += 1;
         // Keep command buffers (and the transient textures they hold) bounded.
-        if self.pending >= 256 {
+        let parked = self.g.pool.lock().map_or(0, |p| p.released_bytes);
+        if self.pending >= 256 || self.pending_bytes + parked >= PENDING_BYTES {
             self.submit();
         }
     }
@@ -1169,6 +1190,7 @@ impl<'g> Enc<'g> {
             }
         }
         self.pending = 0;
+        self.pending_bytes = 0;
     }
 
     /// Read an image back to the CPU (submits and waits). `None` where readback is impossible.
