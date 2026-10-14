@@ -26,7 +26,11 @@ fn dims_xy(dim: u32) -> (f64, f64) {
 }
 
 /// Repeat Edge Pixels: the edge it repeats is the layer rectangle's ([`Buf::cover`]).
+/// On an aligned buffer it grows to the covered buffer instead, so the edge is the same pixels.
 fn cover_for_repeat(ctx: &EffectCtx, b: &mut Buf) {
+    if b.grow_to_main() {
+        return;
+    }
     let dy = crate::cover_plan(b.offset, b.scale, ctx.layer_size, b.img.width, b.img.height).map_or(0, |p| p.1);
     b.cover(ctx.layer_size);
     crate::stack::shift_row_phase(dy as i64);

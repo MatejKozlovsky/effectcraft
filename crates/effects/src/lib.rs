@@ -312,21 +312,53 @@ impl Buf {
     /// Records how many rows the cover would have added on top beyond these
     /// ([`stack::row_phase`]), so CPU blurs round as on the covered buffer.
     pub fn align(&mut self, size: [f64; 2]) {
-        let dy = cover_plan(self.offset, self.scale, size, self.img.width, self.img.height).map_or(0, |p| p.1 as i64);
-        let t = match align_plan(self.offset, self.scale, size, self.img.width, self.img.height) {
+        let (w0, h0) = (self.img.width as i64, self.img.height as i64);
+        let (dx, dy, cw, ch) = cover_plan(self.offset, self.scale, size, self.img.width, self.img.height)
+            .map_or((0, 0, w0, h0), |p| (p.0 as i64, p.1 as i64, p.2 as i64, p.3 as i64));
+        let (l, t) = match align_plan(self.offset, self.scale, size, self.img.width, self.img.height) {
             Some((l, t)) => {
                 self.grow_left_top(l, t);
-                t as i64
+                (l as i64, t as i64)
             }
-            None => 0,
+            None => (0, 0),
         };
         stack::set_row_phase(dy - t);
+        stack::set_main_rect(Some([l - dx, t - dy, cw, ch]));
+    }
+    /// Grow by the given transparent pixels on each side (left, top, right, bottom).
+    pub fn grow_sides(&mut self, l: u32, t: u32, r: u32, b: u32) {
+        if l == 0 && t == 0 && r == 0 && b == 0 {
+            return;
+        }
+        let src = std::mem::replace(&mut self.img, Image::new(0, 0));
+        let (w, h) = (src.width + l + r, src.height + t + b);
+        let mut out = Image::new(w, h);
+        let sw = src.width as usize;
+        for y in 0..src.height as usize {
+            let d = (y + t as usize) * w as usize + l as usize;
+            out.data[d..d + sw].copy_from_slice(&src.data[y * sw..(y + 1) * sw]);
+        }
+        self.img = out;
+        self.offset[0] += l as f64;
+        self.offset[1] += t as f64;
+    }
+    /// Repeat Edge Pixels on an aligned buffer: grow to the covered buffer ([`stack::main_rect`])
+    /// so the repeated edge pixels are the same; false when it is not tracked.
+    pub fn grow_to_main(&mut self) -> bool {
+        let Some([x, y, w, h]) = stack::main_rect() else { return false };
+        let (bw, bh) = (self.img.width as i64, self.img.height as i64);
+        let (l, t, r, b) = ((-x).max(0), (-y).max(0), (x + w - bw).max(0), (y + h - bh).max(0));
+        self.grow_sides(l as u32, t as u32, r as u32, b as u32);
+        stack::set_row_phase(0);
+        stack::set_main_rect(Some([0, 0, self.img.width as i64, self.img.height as i64]));
+        true
     }
     /// Grow by `pad` transparent pixels on every side.
     pub fn pad(&mut self, pad: u32) {
         if pad == 0 {
             return;
         }
+        stack::main_rect_padded(pad);
         self.img = self.img.padded(pad);
         self.offset[0] += pad as f64;
         self.offset[1] += pad as f64;
