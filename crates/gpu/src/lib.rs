@@ -104,6 +104,8 @@ pub struct Gpu {
     auto: Arc<effectcraft_render::AutoPick>,
     /// (comp, reason) pairs already warned about when the GPU declined a frame.
     declined: Arc<std::sync::Mutex<std::collections::HashSet<(u64, String)>>>,
+    /// Frames in flight decided after the first frame ([`Accelerator::frames_in_flight`]).
+    inflight: Arc<std::sync::OnceLock<usize>>,
 }
 
 /// A viewer frame left on the GPU: premultiplied RGBA8 (`wgpu::TextureFormat::Rgba8Unorm`) with
@@ -135,7 +137,7 @@ impl Gpu {
     }
 
     pub fn from_context(ctx: GpuContext) -> Gpu {
-        Gpu { ctx: Arc::new(ctx), auto: Default::default(), declined: Default::default() }
+        Gpu { ctx: Arc::new(ctx), auto: Default::default(), declined: Default::default(), inflight: Default::default() }
     }
 
     /// A device of its own without blocking, with deferred readbacks (a browser worker, see
@@ -225,7 +227,17 @@ impl Gpu {
         }
         let mut e = Enc::new(&self.ctx);
         let img = walk::render(&mut e, r, comp, t)?;
-        e.download(&img)
+        let out = e.download(&img);
+        // The first frame rendered measures the peak memory a frame needs (frames_in_flight).
+        if self.inflight.get().is_none() && self.ctx.sampling.swap(false, std::sync::atomic::Ordering::Relaxed) {
+            let peak = self.ctx.peak.load(std::sync::atomic::Ordering::Relaxed);
+            let budget = self.ctx.memory_budget();
+            // Two frames' peak plus a margin (a tenth of the budget, at least 1 GiB) must fit.
+            let two = budget.is_some_and(|b| peak > 0 && 2 * peak + (b / 10).max(1 << 30) <= b);
+            log::info!(target: "effectcraft_gpu", "GPU frame peak {} MB, budget {:?} MB: {} frame(s) in flight", peak >> 20, budget.map(|b| b >> 20), if two { 2 } else { 1 });
+            let _ = self.inflight.set(if two { 2 } else { 1 });
+        }
+        out
     }
 
     /// [`Gpu::render`] with deferred readbacks: the frame's readback is keyed by comp, time and
@@ -333,6 +345,16 @@ impl Accelerator for Gpu {
             }
         }
         img
+    }
+
+    /// 1 until a frame has rendered, then 2 if two frames' measured peak fits the device's
+    /// memory budget with a margin (see [`GpuContext::memory_budget`]), else 1.
+    fn frames_in_flight(&self) -> Option<usize> {
+        if let Some(&n) = self.inflight.get() {
+            return Some(n);
+        }
+        self.ctx.sampling.store(true, std::sync::atomic::Ordering::Relaxed);
+        Some(1)
     }
 
     fn supports_effect(&self, id: &str) -> bool {

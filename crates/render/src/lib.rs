@@ -463,6 +463,10 @@ pub trait Accelerator: Send + Sync {
     /// and renders the frame again, and the steps whose results arrived are served from them.
     /// The frame is done after a pass with no miss. `frame_begin` forgets the previous frame's
     /// results, `pass_begin` clears the miss. Synchronous accelerators never miss.
+    /// At most this many frames should render on it at once (`None`: no limit of its own).
+    fn frames_in_flight(&self) -> Option<usize> {
+        None
+    }
     fn frame_begin(&self) {}
     fn pass_begin(&self) {}
     fn pass_missed(&self) -> bool {

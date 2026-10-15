@@ -21,7 +21,7 @@ use crate::{Job, RenderQuality, out};
 /// 7.0 to 7.8 GB with two, and the whole card with three, where main fell back to the CPU.
 /// Not sized from free VRAM: the GPU backend reports no free or total device memory on every
 /// platform, so a portable estimate is not available here.
-pub(crate) const GPU_INFLIGHT_DEFAULT: usize = 1;
+pub(crate) const GPU_INFLIGHT_DEFAULT: usize = 2;
 /// Overrides [`GPU_INFLIGHT_DEFAULT`]: a whole number of frames, at least 1.
 pub(crate) const GPU_INFLIGHT_ENV: &str = "EFFECTCRAFT_GPU_INFLIGHT";
 
@@ -48,9 +48,22 @@ pub(crate) fn gpu_inflight(var: Option<&str>) -> usize {
 /// one window of rendered images is held in memory. Chunks hold no lock or slot, so a failing
 /// or panicking frame cannot leak one, and nested parallelism (or a single thread) cannot
 /// deadlock.
+#[cfg(test)]
 pub(crate) fn map_frames<I: Send, T: Send>(
     ks: Vec<u64>,
     cap: Option<usize>,
+    render: impl Fn(u64) -> I + Sync + Send,
+    encode: impl Fn(u64, I) -> T + Sync + Send,
+) -> Vec<T> {
+    map_frames_limited(ks, cap, || usize::MAX, render, encode)
+}
+
+/// [`map_frames`] whose renders at once are also held to `limit()`, read before each chunk
+/// (the accelerator's [`effectcraft_render::Accelerator::frames_in_flight`]).
+pub(crate) fn map_frames_limited<I: Send, T: Send>(
+    ks: Vec<u64>,
+    cap: Option<usize>,
+    limit: impl Fn() -> usize,
     render: impl Fn(u64) -> I + Sync + Send,
     encode: impl Fn(u64, I) -> T + Sync + Send,
 ) -> Vec<T> {
@@ -62,8 +75,11 @@ pub(crate) fn map_frames<I: Send, T: Send>(
     let mut out = Vec::with_capacity(ks.len());
     for win in ks.chunks(window) {
         let mut imgs = Vec::with_capacity(win.len());
-        for chunk in win.chunks(n) {
+        let mut rest = win;
+        while !rest.is_empty() {
+            let (chunk, tail) = rest.split_at(n.min(limit()).clamp(1, rest.len()));
             imgs.par_extend(chunk.par_iter().map(|&k| render(k)));
+            rest = tail;
         }
         out.par_extend(win.par_iter().copied().zip(imgs.into_par_iter()).map(|(k, img)| encode(k, img)));
     }
@@ -187,7 +203,11 @@ impl<'a> Cx<'a> {
             }
             return out;
         }
-        map_frames(ks, self.gpu_cap(), |k| self.frame(comp, k), f)
+        // EFFECTCRAFT_GPU_INFLIGHT is used as given; otherwise the accelerator decides (at most
+        // GPU_INFLIGHT_DEFAULT).
+        let chosen = std::env::var_os(GPU_INFLIGHT_ENV).is_some();
+        let limit = || if chosen { usize::MAX } else { self.job.accel.and_then(|a| a.frames_in_flight()).unwrap_or(usize::MAX) };
+        map_frames_limited(ks, self.gpu_cap(), limit, |k| self.frame(comp, k), f)
     }
 
     /// GPU frames rendered at once (#879), decided once per batch: with a GPU accelerator every

@@ -151,6 +151,13 @@ impl Transfers {
     }
 }
 
+/// Testing aid: `EFFECTCRAFT_GPU_BUDGET_PCT` makes allocations fail once that percentage of
+/// the driver's memory budget is in use (D3D12; Vulkan with VK_EXT_memory_budget), to act as
+/// a smaller GPU.
+fn budget_pct() -> Option<u8> {
+    std::env::var("EFFECTCRAFT_GPU_BUDGET_PCT").ok()?.trim().parse().ok()
+}
+
 fn tex_bytes(t: &wgpu::Texture) -> usize {
     t.width() as usize * t.height() as usize * 16
 }
@@ -316,6 +323,9 @@ pub struct GpuContext {
     uploads: Mutex<Uploads>,
     upload_budget: std::sync::atomic::AtomicUsize,
     upload_full_warned: std::sync::atomic::AtomicBool,
+    /// While set, texture allocations record the allocator's reserved bytes in `peak`.
+    pub(crate) sampling: std::sync::atomic::AtomicBool,
+    pub(crate) peak: std::sync::atomic::AtomicU64,
     pool: Arc<Mutex<Pool>>,
     /// CPU ↔ GPU traffic (diagnostics: `bench --gpu`).
     pub(crate) transfers: Transfers,
@@ -663,6 +673,8 @@ impl GpuContext {
             uploads: Mutex::new(Uploads::default()),
             upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_full_warned: Default::default(),
+            sampling: Default::default(),
+            peak: Default::default(),
             pool: Default::default(),
             staging: Default::default(),
             transfers: Default::default(),
@@ -795,6 +807,7 @@ impl GpuContext {
             // Match eframe's backend override so CLI and headless acceptance tests
             // exercise the backend requested for the native viewer.
             desc.backends = wgpu::Backends::from_env().unwrap_or(desc.backends);
+            desc.memory_budget_thresholds.for_resource_creation = budget_pct();
         }
         #[cfg(target_arch = "wasm32")]
         {
@@ -868,6 +881,11 @@ impl GpuContext {
     }
 
     fn texture(&self, w: u32, h: u32) -> wgpu::Texture {
+        if self.sampling.load(std::sync::atomic::Ordering::Relaxed)
+            && let Some(r) = self.device.generate_allocator_report()
+        {
+            self.peak.fetch_max(r.total_reserved_bytes, std::sync::atomic::Ordering::Relaxed);
+        }
         self.device.create_texture(&wgpu::TextureDescriptor {
             label: None,
             size: wgpu::Extent3d { width: w.max(1), height: h.max(1), depth_or_array_layers: 1 },
@@ -878,6 +896,14 @@ impl GpuContext {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::STORAGE_BINDING | wgpu::TextureUsages::COPY_SRC | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         })
+    }
+
+    /// The GPU memory this process may use (bytes), when known: `EFFECTCRAFT_GPU_BUDGET_MB`.
+    /// wgpu has no safe query for it (the Vulkan / D3D12 budget needs `unsafe` hal access,
+    /// which the workspace forbids).
+    pub fn memory_budget(&self) -> Option<u64> {
+        let mb: u64 = std::env::var("EFFECTCRAFT_GPU_BUDGET_MB").ok()?.trim().parse().ok()?;
+        (mb > 0).then_some(mb << 20)
     }
 
     /// A pooled working texture: (image, reused). A reused texture holds old pixels; a new
