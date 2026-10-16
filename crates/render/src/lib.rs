@@ -420,6 +420,9 @@ pub struct FxStep<'x> {
     pub ctx: EffectCtx<'x>,
 }
 
+/// Receives the planes of an asynchronous [`Accelerator::comp_frame_yuv420_async`] frame.
+pub type YuvDone = Box<dyn FnOnce(Option<Vec<u8>>) + Send>;
+
 /// A GPU (or other hardware) backend for the compositor. The CPU [`Renderer`] stays the
 /// reference: an accelerator renders what it supports and returns `None` for the rest, which
 /// then runs on the CPU. Implemented by `effectcraft-gpu`.
@@ -436,6 +439,30 @@ pub trait Accelerator: Send + Sync {
     /// boundary). `None` = not handled (the caller renders and converts on the CPU).
     fn comp_frame_yuv420(&self, _r: &Renderer, _comp: ItemId, _t: Tick, _bg: [f32; 3]) -> Option<Vec<u8>> {
         None
+    }
+    /// [`Self::comp_frame_yuv420`] without waiting for the readback: the planes go to `done`
+    /// from a later [`Self::poll_readbacks`] (`None`: the readback failed; `done` runs exactly
+    /// once). `Err(done)` = not handled, `done` untouched (the caller renders on the CPU).
+    /// Each frame in flight holds device memory, so an implementation bounds them: the GPU
+    /// compositor keeps at most 4 and makes a fifth call wait (polling the device, at worst
+    /// until the readback deadline) for one to finish. `done` runs on whichever thread polls
+    /// the device, outside the accelerator's locks; it must not block on other frames or call
+    /// back into the accelerator (hand the planes to a queue instead). The default converts
+    /// synchronously.
+    fn comp_frame_yuv420_async(&self, r: &Renderer, comp: ItemId, t: Tick, bg: [f32; 3], done: YuvDone) -> Result<(), YuvDone> {
+        match self.comp_frame_yuv420(r, comp, t, bg) {
+            Some(planes) => {
+                done(Some(planes));
+                Ok(())
+            }
+            None => Err(done),
+        }
+    }
+    /// Deliver finished [`Self::comp_frame_yuv420_async`] readbacks, waiting up to `wait` for
+    /// the device (`None`: don't wait). `false`: the device failed and every pending readback
+    /// got `None`.
+    fn poll_readbacks(&self, _wait: Option<std::time::Duration>) -> bool {
+        true
     }
     /// The accelerator implements effect `id` with the CPU effect's semantics.
     fn supports_effect(&self, id: &str) -> bool;
