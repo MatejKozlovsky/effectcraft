@@ -86,6 +86,8 @@ pub trait Accelerator: Send + Sync {
     /// results, `pass_begin` clears the miss. Synchronous accelerators never miss.
     fn frame_begin(&self) {}
     fn pass_begin(&self) {}
+    /// An output frame of a render is done (the GPU pool ages sizes no frame asks for).
+    fn frame_end(&self) {}
     /// A render of many frames (an export) is done: drop what is kept only to speed up the
     /// next frame (pooled working textures). Exports call it, even when they fail, panic or
     /// are dropped; other multi-frame paths (preview, remote frames) don't, so there the pool

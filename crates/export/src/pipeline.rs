@@ -237,6 +237,9 @@ impl<'a> Cx<'a> {
                 if second == first { a } else { interleave(&a, &self.render_at(second).await, upper_first) }
             }
         };
+        if let Some(a) = self.job.accel {
+            a.frame_end();
+        }
         let mut img = img;
         // Color Depth: renders run at the project's depth; another depth quantises the frame.
         let depth = self.job.settings.color_depth;
