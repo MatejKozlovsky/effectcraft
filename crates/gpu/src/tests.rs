@@ -778,7 +778,7 @@ fn display_frames_are_mipmapped() {
         view_formats: &[],
     });
     let mut e = crate::context::Enc::new(&g.ctx);
-    e.encoder().copy_texture_to_texture(
+    e.record(&[]).copy_texture_to_texture(
         wgpu::TexelCopyTextureInfo { texture: &f.texture, mip_level: 1, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
         wgpu::TexelCopyTextureInfo { texture: &tex, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
         wgpu::Extent3d { width: w1, height: h1, depth_or_array_layers: 1 },
@@ -1393,4 +1393,33 @@ fn effect_calls_on_16_threads_keep_one_pool_budget() {
     assert!(kept <= budget, "16 threads of effect calls keep {} MB, budget {} MB", kept >> 20, budget >> 20);
     effectcraft_render::Accelerator::render_end(g);
     assert_eq!(ctx.pool_retained_bytes(), 0, "the end of a render drops the kept textures");
+}
+
+/// Sceptic r2 of #1523: only the export pipeline ended frames, so off export (preview, remote
+/// frames) the pool's clock stood still, no size ever went stale and a full free list dropped
+/// every newcomer again. Frames rendered through [`effectcraft_render::passes::comp_frame`]
+/// (no explicit `pool_frame_end`) must age the sizes they did not ask for.
+#[test]
+fn frames_outside_the_export_pipeline_age_the_pool() {
+    let budget = 8 << 20;
+    let Some(g) = private_gpu(budget) else { return };
+    let ctx = g.context();
+    // Fill the free list with sizes no frame asks for again.
+    for k in 0..16 {
+        let mut e = crate::context::Enc::lent(ctx);
+        drop((e.image(256 + k, 256), e.image(256 + k, 256)));
+    }
+    let evicted0 = ctx.pool_evictions();
+    let s = blend_scene(BitDepth::Bpc8, BlendMode::Screen);
+    let mut r = Renderer::new(&s.p, &Pattern, opts());
+    r.accel = Some(&g);
+    for _ in 0..3 {
+        effectcraft_render::passes::block_on(effectcraft_render::passes::comp_frame(&r, s.cid, Tick::ZERO));
+    }
+    for _ in 0..4 {
+        let mut e = crate::context::Enc::lent(ctx);
+        drop((e.image(300, 300), e.image(300, 300)));
+    }
+    assert!(ctx.pool_retained_bytes() <= budget);
+    assert!(ctx.pool_evictions() > evicted0, "rendered frames did not age the pool: stale sizes were never evicted");
 }
