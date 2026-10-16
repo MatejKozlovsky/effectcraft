@@ -175,10 +175,9 @@ pub fn export(job: &Job, progress: &mut dyn FnMut(&Progress) -> bool) -> Result<
 pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> bool) -> Result<Report> {
     let t0 = Instant::now();
     let cx = Cx::new(job);
+    let render = RenderEnd(job.accel);
     let mut r = export_with(&cx, progress, t0).await;
-    if let Some(a) = job.accel {
-        a.render_end();
-    }
+    drop(render);
     if matches!(r, Err(ExportError::Cancelled)) {
         cx.remove_cancelled_outputs()?;
         return r;
@@ -189,6 +188,18 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
         rep.overflow = cx.overflowed.lock().unwrap_or_else(|e| e.into_inner()).clone();
     }
     r
+}
+
+/// Calls [`effectcraft_render::Accelerator::render_end`] when dropped: after the export, and
+/// also when it panics or its future is dropped (a browser worker aborting it).
+struct RenderEnd<'a>(Option<&'a dyn effectcraft_render::Accelerator>);
+
+impl Drop for RenderEnd<'_> {
+    fn drop(&mut self) {
+        if let Some(a) = self.0 {
+            a.render_end();
+        }
+    }
 }
 
 async fn export_with(cx: &Cx<'_>, progress: &mut dyn FnMut(&Progress) -> bool, t0: Instant) -> Result<Report> {
