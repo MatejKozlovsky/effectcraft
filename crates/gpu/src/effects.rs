@@ -45,22 +45,15 @@ impl GBuf {
     }
 }
 
-thread_local! {
-    /// This thread's last chain result still on the device, with the address of the pixels it
-    /// was read back into ([`take_last_chain`]). The renderer takes it at the end of every
-    /// effect stack, so it never outlives one.
-    static LAST_CHAIN: std::cell::RefCell<Option<(usize, GpuImage)>> = const { std::cell::RefCell::new(None) };
-}
-
-/// This thread's last [`run_chain`] result on the device and the address of the pixels it was
-/// read back into (taken: at most one stack holds it).
-pub(crate) fn take_last_chain() -> Option<(usize, GpuImage)> {
-    LAST_CHAIN.with(|c| c.borrow_mut().take())
-}
-
 /// Run a chain of GPU effects (one upload, one readback), quantising after each when `levels`
 /// is set. `None` when anything cannot run here.
 pub(crate) fn run_chain(e: &mut Enc, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<Buf> {
+    run_chain_held(e, chain, buf, levels).map(|(b, _)| b)
+}
+
+/// [`run_chain`], also returning the result's device image when the hand-off is on (the
+/// caller owns it; nothing is kept here).
+pub(crate) fn run_chain_held(e: &mut Enc, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<GpuImage>)> {
     if !e.g.can_readback() || buf.img.is_empty() {
         return None;
     }
@@ -69,16 +62,14 @@ pub(crate) fn run_chain(e: &mut Enc, chain: &[FxStep], buf: &Buf, levels: Option
     let key = deferred.as_ref().map(|_| crate::deferred::chain_key(chain, buf, levels));
     if let (Some(d), Some(k)) = (&deferred, key) {
         match d.lookup(k) {
-            crate::deferred::Lookup::Ready(r) => return r.and_then(readback_buf),
+            crate::deferred::Lookup::Ready(r) => return r.and_then(readback_buf).map(|b| (b, None)),
             crate::deferred::Lookup::InFlight => {
                 d.miss();
-                return Some(buf.clone());
+                return Some((buf.clone(), None));
             }
             crate::deferred::Lookup::Absent => {}
         }
     }
-    // A result left by an earlier chain is not this one's.
-    LAST_CHAIN.with(|c| c.borrow_mut().take());
     let misses = deferred.as_ref().map(|d| d.misses());
     let mut b = GBuf { img: e.g.upload_image(&buf.img)?, offset: buf.offset, scale: buf.scale };
     e.take_missing();
@@ -95,19 +86,17 @@ pub(crate) fn run_chain(e: &mut Enc, chain: &[FxStep], buf: &Buf, levels: Option
         // Data the kernels fetched through the effect host missed meanwhile: not genuine.
         if Some(d.misses()) != misses {
             d.miss();
-            return Some(buf.clone());
+            return Some((buf.clone(), None));
         }
         // The placeholder (the input) keeps this pass cheap; the next pass gets the result.
         return match e.read_keyed(&b.img, k, b.offset, b.scale) {
-            Some(r) => r.and_then(readback_buf),
-            None => Some(buf.clone()),
+            Some(r) => r.and_then(readback_buf).map(|b| (b, None)),
+            None => Some((buf.clone(), None)),
         };
     }
     let img = e.download(&b.img)?;
-    if e.g.handoff.load(std::sync::atomic::Ordering::Relaxed) {
-        LAST_CHAIN.with(|c| *c.borrow_mut() = Some((img.data.as_ptr() as usize, b.img.clone())));
-    }
-    Some(Buf { img, offset: b.offset, scale: b.scale })
+    let held = e.g.handoff.load(std::sync::atomic::Ordering::Relaxed).then(|| b.img.clone());
+    Some((Buf { img, offset: b.offset, scale: b.scale }, held))
 }
 
 /// A layer buffer from deferred readback bytes (RGBA f32).

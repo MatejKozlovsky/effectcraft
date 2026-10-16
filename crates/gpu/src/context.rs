@@ -315,8 +315,8 @@ pub struct GpuContext {
     dummy_tex: wgpu::TextureView,
     dummy_buf: wgpu::Buffer,
     uploads: Mutex<Uploads>,
-    /// Keep effect-chain results on the device for the compositor (`EFFECTCRAFT_NO_HANDOFF=1`
-    /// turns it off; read once, tests switch it).
+    /// Keep effect-chain results on the device for the compositor ([`crate::Gpu::set_handoff`];
+    /// tests switch it).
     pub(crate) handoff: AtomicBool,
     upload_budget: std::sync::atomic::AtomicUsize,
     upload_full_warned: std::sync::atomic::AtomicBool,
@@ -665,7 +665,7 @@ impl GpuContext {
             dummy,
             dummy_buf,
             uploads: Mutex::new(Uploads::default()),
-            handoff: AtomicBool::new(std::env::var_os("EFFECTCRAFT_NO_HANDOFF").is_none()),
+            handoff: AtomicBool::new(true),
             upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_full_warned: Default::default(),
             pool: Default::default(),

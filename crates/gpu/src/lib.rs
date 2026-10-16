@@ -176,6 +176,12 @@ impl Gpu {
         Some((d.passes.load(std::sync::atomic::Ordering::Relaxed), d.readbacks.load(std::sync::atomic::Ordering::Relaxed), d.in_flight()))
     }
 
+    /// Keep effect-chain results on the device for the compositor (on by default; the CLI
+    /// turns it off with `EFFECTCRAFT_NO_HANDOFF=1`).
+    pub fn set_handoff(&self, on: bool) {
+        self.ctx.handoff.store(on, std::sync::atomic::Ordering::Relaxed);
+    }
+
     pub fn context(&self) -> &GpuContext {
         &self.ctx
     }
@@ -348,17 +354,17 @@ impl Accelerator for Gpu {
         effects::run_chain(&mut Enc::new(&self.ctx), chain, buf, levels)
     }
 
-    fn take_chain(&self) -> Option<effectcraft_render::ChainHold> {
-        effects::take_last_chain().map(|h| Box::new(h) as effectcraft_render::ChainHold)
+    fn effects_held(&self, chain: &[FxStep], buf: &Buf, levels: Option<f32>) -> Option<(Buf, Option<effectcraft_render::ChainHold>)> {
+        self.ctx.check_health().ok()?;
+        let (out, img) = effects::run_chain_held(&mut Enc::new(&self.ctx), chain, buf, levels)?;
+        let hold = img.map(|img| effectcraft_render::ChainHold::new(&out, img));
+        Some((out, hold))
     }
 
     fn adopt(&self, buf: &std::sync::Arc<Buf>, hold: effectcraft_render::ChainHold) {
-        // Only the very pixels the chain was read back into (`buf` is alive, so its address
-        // cannot have been reused).
-        if let Ok(h) = hold.downcast::<(usize, GpuImage)>()
-            && h.0 == buf.img.data.as_ptr() as usize
-        {
-            self.ctx.adopt_upload(buf, h.1);
+        // The renderer checked that `buf` holds the very pixels the chain was read back into.
+        if let Some(img) = hold.into_inner::<GpuImage>() {
+            self.ctx.adopt_upload(buf, img);
         }
     }
 
