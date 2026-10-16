@@ -44,8 +44,14 @@ const UPLOAD_BUDGET: usize = 1536 << 20;
 /// Working textures kept for reuse once their last image is dropped (bytes).
 const POOL_BUDGET: usize = 256 << 20;
 
-/// Output frames after which a size the pool was not asked for is stale: only stale sizes are
+/// Frames after which a size the pool was not asked for is stale: only stale sizes are
 /// evicted to make room (see [`Pool::make_free`]).
+///
+/// The clock is coarse: it advances on every finished frame ([`GpuContext::pool_frame_end`])
+/// from any thread, so with many frames in flight (an export renders up to 16 at once) this
+/// means "not asked for during the last 2 completions", not "during 2 frames' rendering". A
+/// size a slower in-flight frame still needs can go stale and be evicted. That costs a pool
+/// miss (a new allocation), never a wrong pixel.
 const STALE_FRAMES: u64 = 2;
 
 /// Readback staging buffers kept for reuse across sizes (bytes).
@@ -71,8 +77,8 @@ impl GpuImage {
         GpuImage { texture, width, height, _lease: None, levels: None }
     }
 
-    /// This image leaves the [`Enc`] that made it (kept in a cache, or read by an encoder that
-    /// may stay open): when its last clone drops, its texture waits for every open encoder
+    /// This image leaves the [`Enc`] that made it (read by an encoder that may stay open, see
+    /// [`Enc::uses`]): when its last clone drops, its texture waits for every open encoder
     /// ([`Pool::release`]) instead of going back to that `Enc` for immediate reuse.
     pub(crate) fn escape(&self) {
         if let Some(l) = &self._lease {
@@ -94,7 +100,7 @@ struct Lease {
     owner: u64,
     /// The pool's [`Pool::generation`] when it was taken.
     generation: u64,
-    /// Another [`Enc`] recorded work on it, or it was handed to a cache ([`GpuImage::escape`]):
+    /// Another [`Enc`] recorded work on it ([`Enc::uses`], [`GpuImage::escape`]):
     /// its owner can no longer reuse it at once, since that other encoder may still be open, so
     /// it is released through the guarded [`Pool::release`].
     escaped: std::sync::atomic::AtomicBool,
@@ -294,7 +300,9 @@ impl Pool {
     /// take. If nothing stale makes room, `t` is dropped (the kept set keeps hitting).
     ///
     /// Evicted textures count against the budget ([`Pool::dying`]) until the GPU work
-    /// submitted so far is done, so evictions free at most one budget ahead of the GPU.
+    /// submitted so far is done. That throttles eviction to roughly one budget ahead of the
+    /// GPU; it is not a hard bound (wgpu frees a dropped texture only when the device is
+    /// maintained, which can be later than the work-done callback).
     fn make_free(&mut self, t: wgpu::Texture) {
         use std::sync::atomic::Ordering::Relaxed;
         let b = tex_bytes(&t);
@@ -417,7 +425,7 @@ impl Pool {
     /// They skip [`Pool::release`]'s wait for open encoders: a kept texture's lease has
     /// dropped and only this `Enc` recorded work on it, which is already submitted or
     /// discarded, so later work cannot overtake it on the queue. That is enforced, not assumed:
-    /// a lease read by another `Enc` or handed to a cache is marked escaped
+    /// a lease read by another `Enc` is marked escaped
     /// ([`GpuImage::escape`]) and released through [`Pool::release`] whenever it drops, and a
     /// lease that drops after this call finds no owner and goes the same way.
     fn give_back(&mut self, owner: u64) {
@@ -1442,8 +1450,8 @@ impl<'g> Enc<'g> {
 
     /// An `Enc` for self-contained work (an effect chain): once it is dropped, its working
     /// textures can be reused at once ([`Pool::give_back`]). Its images stay with it, except a
-    /// result handed on (e.g. to the upload cache), whose lease then releases through the
-    /// guarded [`Pool::release`]. A plain [`Enc::new`] hands its
+    /// result another `Enc` records work on ([`Enc::uses`]), whose lease then releases through
+    /// the guarded [`Pool::release`]. A plain [`Enc::new`] hands its
     /// textures back through the shared pool, where they wait for every open encoder, and a
     /// GPU frame keeps its encoder open while the CPU renders layers with GPU effects, so every
     /// effect's intermediates stayed allocated until the frame ended.
@@ -1466,6 +1474,22 @@ impl<'g> Enc<'g> {
         std::mem::take(&mut self.missing)
     }
 
+    /// The command encoder, to record work that touches `imgs` (every pooled image the commands
+    /// read or write; buffers and textures of the caller's own need not be named). The way to
+    /// record outside this module: naming the images marks foreign leases escaped
+    /// ([`Enc::uses`]). Callers must name every pooled image the encoder's work uses, here or
+    /// with separate [`Enc::uses`] calls (`record(&[])` plus `uses()` is allowed); this is a
+    /// convention, not enforced, and skipping it reintroduces the reuse race it guards (#1441).
+    pub(crate) fn record(&mut self, imgs: &[&GpuImage]) -> &mut wgpu::CommandEncoder {
+        for img in imgs {
+            self.uses(img);
+        }
+        self.encoder()
+    }
+
+    /// The raw encoder; prefer [`Enc::record`]. Name every pooled image of another `Enc` the
+    /// work touches with [`Enc::uses`] first, unless the work is submitted while those images
+    /// are still alive (as `yuv::record` does), so no reuse of their textures can precede it.
     pub(crate) fn encoder(&mut self) -> &mut wgpu::CommandEncoder {
         let g = self.g;
         &mut self
@@ -1531,9 +1555,6 @@ impl<'g> Enc<'g> {
     ) {
         let KernelImages { src, aux, out } = images;
         let g = self.g;
-        self.uses(src);
-        aux.inspect(|a| self.uses(a));
-        self.uses(out);
         let Some(pipe) = g.pipelines.get(entry) else {
             if !g.unavailable.iter().any(|(e, _)| *e == entry) {
                 log::error!("gpu: no kernel {entry}");
@@ -1568,7 +1589,8 @@ impl<'g> Enc<'g> {
                 ],
             })
         });
-        let enc = self.encoder();
+        let imgs: Vec<&GpuImage> = [Some(src), aux, Some(out)].into_iter().flatten().collect();
+        let enc = self.record(&imgs);
         {
             let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(entry), timestamp_writes: None });
             pass.set_pipeline(pipe);
@@ -1593,9 +1615,7 @@ impl<'g> Enc<'g> {
 
     /// Copy `src` into a larger zeroed image at (`x`, `y`) (Buf::pad).
     pub fn copy_into(&mut self, src: &GpuImage, dst: &GpuImage, x: u32, y: u32) {
-        self.uses(src);
-        self.uses(dst);
-        let enc = self.encoder();
+        let enc = self.record(&[src, dst]);
         enc.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d::ZERO, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d { x, y, z: 0 }, aspect: wgpu::TextureAspect::All },
