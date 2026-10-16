@@ -117,8 +117,16 @@ pub(crate) struct Pool {
     /// working texture of another `Enc` before it is gone.
     owned: HashMap<u64, HashMap<(u32, u32), Vec<wgpu::Texture>>>,
     next_owner: u64,
-    /// Owners kept between [`Enc::lent`] calls, each lent to one `Enc` at a time.
-    idle: Vec<u64>,
+}
+
+/// Tests lower [`POOL_BUDGET`] (bytes; 0 = the default) to fill it with small textures.
+pub(crate) static POOL_BUDGET_OVERRIDE: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn pool_budget() -> usize {
+    match POOL_BUDGET_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed) {
+        0 => POOL_BUDGET,
+        b => b,
+    }
 }
 
 /// In-`Enc` texture reuse ([`Pool::owned`]); tests turn it off to compare.
@@ -233,7 +241,7 @@ impl Pool {
 
     fn make_free(&mut self, t: wgpu::Texture) {
         let b = tex_bytes(&t);
-        if self.bytes + b > POOL_BUDGET {
+        if self.bytes.saturating_add(b) > pool_budget() {
             return;
         }
         self.bytes += b;
@@ -285,20 +293,35 @@ impl Pool {
         self.release(t);
     }
 
-    /// An owner for [`Enc::lent`]: an idle one with its kept textures, or a new one.
+    /// An owner for [`Enc::lent`]. It is a fresh id each time, so a lease of an earlier lent
+    /// `Enc` that drops later (an image that outlived its call) finds no owner and goes
+    /// through [`Pool::release`], which waits for every open encoder.
     fn lend(&mut self) -> u64 {
-        self.idle.pop().unwrap_or_else(|| self.register())
+        self.register()
     }
 
-    /// [`Enc::lent`] is done with `owner` (its work submitted or discarded): keep its
-    /// textures for the next one, up to the pool budget.
+    /// [`Enc::lent`] is done with `owner` (its work submitted or discarded): its kept textures
+    /// go to the shared free list at once, under the one [`POOL_BUDGET`] that also bounds what
+    /// every other idle call keeps, so 16 frame threads keep at most `POOL_BUDGET` between
+    /// them, not 16 × `POOL_BUDGET`. They skip [`Pool::release`]'s wait for open encoders: a
+    /// kept texture's lease has dropped and only this `Enc` ever recorded work on it, which is
+    /// already submitted or discarded, so later work cannot overtake it on the queue. This
+    /// does not rely on the result being read back: an image handed to another encoder keeps
+    /// its lease, and when that lease drops after this call it is released through
+    /// [`Pool::release`] (the owner is gone).
     fn give_back(&mut self, owner: u64) {
-        if let Some(m) = self.owned.get_mut(&owner)
-            && m.values().flatten().map(tex_bytes).sum::<usize>() > POOL_BUDGET
-        {
-            m.clear();
+        if let Some(m) = self.owned.remove(&owner) {
+            for t in m.into_values().flatten() {
+                self.make_free(t);
+            }
         }
-        self.idle.push(owner);
+    }
+
+    /// Bytes of working textures kept for reuse: the free list, those waiting for open
+    /// encoders and those kept by live `Enc`s.
+    fn retained(&self) -> usize {
+        let owned = self.owned.values().flat_map(|m| m.values().flatten());
+        self.released.iter().map(|(t, _)| t).chain(owned).map(tex_bytes).fold(self.bytes, usize::saturating_add)
     }
 
     fn take_owned(&mut self, owner: u64, w: u32, h: u32) -> Option<wgpu::Texture> {
@@ -1004,6 +1027,19 @@ impl GpuContext {
         }
     }
 
+    /// Bytes of working textures the pool keeps for reuse (see [`GpuContext::trim_pool`]).
+    pub fn pool_retained_bytes(&self) -> usize {
+        self.pool.lock().map(|p| p.retained()).unwrap_or_default()
+    }
+
+    /// Drop the working textures kept for reuse (a render is done). Textures still waiting for
+    /// an open encoder and those of live `Enc`s are unaffected.
+    pub fn trim_pool(&self) {
+        if let Ok(mut p) = self.pool.lock() {
+            p.clear();
+        }
+    }
+
     /// Texture pool counters: (working textures reused, newly allocated).
     pub fn pool_stats(&self) -> (u64, u64) {
         self.pool.lock().map(|p| (p.hits, p.misses)).unwrap_or_default()
@@ -1131,12 +1167,13 @@ impl<'g> Enc<'g> {
         Enc { g, enc: None, pending: 0, missing: false, owner, lent: false }
     }
 
-    /// An `Enc` for self-contained work that ends in a readback (submitted and waited for, or
-    /// discarded), whose images never reach another `Enc`: it reuses the working textures of
-    /// earlier such work at once. A plain [`Enc::new`] hands its textures back through the
-    /// shared pool, where they wait for every open encoder, and a GPU frame keeps its encoder
-    /// open while the CPU renders layers with GPU effects, so every effect's intermediates
-    /// stayed allocated until the frame ended.
+    /// An `Enc` for self-contained work (an effect chain): once it is dropped, its working
+    /// textures can be reused at once ([`Pool::give_back`]). Its images stay with it, except a
+    /// result handed on (e.g. to the upload cache), whose lease then releases through the
+    /// guarded [`Pool::release`]. A plain [`Enc::new`] hands its
+    /// textures back through the shared pool, where they wait for every open encoder, and a
+    /// GPU frame keeps its encoder open while the CPU renders layers with GPU effects, so every
+    /// effect's intermediates stayed allocated until the frame ended.
     pub(crate) fn lent(g: &'g GpuContext) -> Enc<'g> {
         let owner = g.pool.lock().map(|mut p| p.lend()).unwrap_or(0);
         Enc { g, enc: None, pending: 0, missing: false, owner, lent: true }
