@@ -469,7 +469,7 @@ fn raster_into(e: &mut Enc, s: &Scene) -> Option<(wgpu::Texture, wgpu::Texture)>
     let zout = tex(DEPTH_OUT, rt);
     let depth = tex(DEPTH, wgpu::TextureUsages::RENDER_ATTACHMENT);
     let (cv, zv, dv) = (color.create_view(&Default::default()), zout.create_view(&Default::default()), depth.create_view(&Default::default()));
-    let enc = e.encoder();
+    let enc = e.record(&[]);
     {
         let mut pass = enc.begin_render_pass(&wgpu::RenderPassDescriptor {
             label: Some("adv3d"),
@@ -743,7 +743,7 @@ fn dispatch(e: &mut Enc, kernel: &str, u0: [u32; 4], f0: [f32; 4], b: Binds, gro
     }
     entries.push(wgpu::BindGroupEntry { binding: 10, resource: wgpu::BindingResource::TextureView(b.out.unwrap_or(&post.dummy_out)) });
     let bg = g.device.create_bind_group(&wgpu::BindGroupDescriptor { label: Some(kernel), layout: &post.bgl, entries: &entries });
-    let enc = e.encoder();
+    let enc = e.record(&[]);
     let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor { label: Some(kernel), timestamp_writes: None });
     pass.set_pipeline(pipe);
     pass.set_bind_group(0, &bg, &[]);
@@ -779,7 +779,7 @@ fn read_buffer(e: &mut Enc, buf: &wgpu::Buffer, size: u64) -> Option<Vec<u8>> {
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    e.encoder().copy_buffer_to_buffer(buf, 0, &rb, 0, size);
+    e.record(&[]).copy_buffer_to_buffer(buf, 0, &rb, 0, size);
     e.submit();
     let out = e.g.read_buffer(&rb, row, row, 1).map_err(|e| log::error!("gpu 3d readback: {e}")).ok()?;
     Some(out)
@@ -1004,7 +1004,7 @@ fn render_prepared_deferred(g: &GpuContext, d: &std::sync::Arc<crate::deferred::
         usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
         mapped_at_creation: false,
     });
-    e.encoder().copy_buffer_to_buffer(&r.depth, 0, &rb, 0, size);
+    e.record(&[]).copy_buffer_to_buffer(&r.depth, 0, &rb, 0, size);
     e.submit();
     let done = d.start(kz, w, h, [0.0; 2], 1.0);
     g.map_readback(&rb, row, row, 1, move |r| done(r.map_err(|e| log::error!("gpu depth readback: {e}")).ok()));
