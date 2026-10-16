@@ -104,7 +104,7 @@ pub(crate) fn run_chain(e: &mut Enc, chain: &[FxStep], buf: &Buf, levels: Option
         };
     }
     let img = e.download(&b.img)?;
-    if e.g.handoff {
+    if e.g.handoff.load(std::sync::atomic::Ordering::Relaxed) {
         LAST_CHAIN.with(|c| *c.borrow_mut() = Some((img.data.as_ptr() as usize, b.img.clone())));
     }
     Some(Buf { img, offset: b.offset, scale: b.scale })
