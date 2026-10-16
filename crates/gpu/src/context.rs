@@ -42,7 +42,7 @@ pub const FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba32Float;
 const UPLOAD_BUDGET: usize = 1536 << 20;
 
 /// Working textures kept for reuse once their last image is dropped (bytes).
-const POOL_BUDGET: usize = 768 << 20;
+const POOL_BUDGET: usize = 256 << 20;
 
 /// Output frames after which a size the pool was not asked for is stale: only stale sizes are
 /// evicted to make room (see [`Pool::make_free`]).
