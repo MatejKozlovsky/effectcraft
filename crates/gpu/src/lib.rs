@@ -377,6 +377,10 @@ impl Accelerator for Gpu {
         }
     }
 
+    fn frame_end(&self) {
+        self.ctx.pool_frame_end();
+    }
+
     fn pass_begin(&self) {
         if let Some(d) = self.ctx.deferred() {
             d.pass_begin();

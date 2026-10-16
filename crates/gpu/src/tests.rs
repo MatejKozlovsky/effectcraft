@@ -1118,16 +1118,52 @@ fn stale_sizes_do_not_starve_a_steady_size() {
     for k in 0..16 {
         let mut e = crate::context::Enc::lent(ctx);
         drop((e.image(256 + k, 256), e.image(256 + k, 256)));
+        drop(e);
+        ctx.pool_frame_end();
     }
     let (hits0, misses0) = ctx.pool_stats();
     for _ in 0..10 {
         let mut e = crate::context::Enc::lent(ctx);
         drop((e.image(300, 300), e.image(300, 300)));
+        drop(e);
+        ctx.pool_frame_end();
     }
     let (hits, misses) = (ctx.pool_stats().0 - hits0, ctx.pool_stats().1 - misses0);
     assert!(ctx.pool_retained_bytes() <= budget);
     assert!(ctx.pool_evictions() > 0, "the stale sizes were evicted");
     assert!(hits >= 18 && misses <= 2, "steady 300x300 calls after stale sizes: {hits} hits, {misses} misses");
+}
+
+/// RTX 3090 4K runs of #1523: evicting the least recently freed texture to fit every newcomer
+/// thrashes when a frame frees more than the budget in a repeating order (blur/glow
+/// intermediates): each free evicts the size the next call takes first, so every take
+/// missed (d_blurglow misses back at the old level, and evict + reallocate raised the peak).
+/// Sizes still in use stay; a kept subset of the cycle must keep hitting.
+#[test]
+fn repeating_sizes_over_the_budget_keep_hitting() {
+    let budget = 8 << 20;
+    let Some(g) = private_gpu(budget) else { return };
+    let ctx = g.context();
+    // Five ~2.1 MB sizes a frame (10.5 MB > 8 MB), one effect call each, same order every frame.
+    let sizes: Vec<(u32, u32)> = (0..5).map(|k| (256 + 8 * k, 512)).collect();
+    let frame = || {
+        for &(w, h) in &sizes {
+            drop(crate::context::Enc::lent(ctx).image(w, h));
+        }
+        ctx.pool_frame_end();
+    };
+    for _ in 0..3 {
+        frame();
+    }
+    let (hits0, misses0) = ctx.pool_stats();
+    let evicted0 = ctx.pool_evictions();
+    for _ in 0..10 {
+        frame();
+    }
+    let (hits, misses) = (ctx.pool_stats().0 - hits0, ctx.pool_stats().1 - misses0);
+    assert!(ctx.pool_retained_bytes() <= budget);
+    assert!(hits >= 30, "10 frames of a 5-size cycle over the budget: {hits} hits, {misses} misses");
+    assert_eq!(ctx.pool_evictions(), evicted0, "sizes in use were evicted");
 }
 
 /// Review of #1523: a lent call's image read by another, still open encoder must not go back to

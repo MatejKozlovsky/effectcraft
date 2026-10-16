@@ -43,6 +43,10 @@ const UPLOAD_BUDGET: usize = 1536 << 20;
 /// Working textures kept for reuse once their last image is dropped (bytes).
 const POOL_BUDGET: usize = 768 << 20;
 
+/// Output frames after which a size the pool was not asked for is stale: only stale sizes are
+/// evicted to make room (see [`Pool::make_free`]).
+const STALE_FRAMES: u64 = 2;
+
 /// Readback staging buffers kept for reuse across sizes (bytes).
 const STAGING_BUDGET: u64 = 256 << 20;
 
@@ -139,6 +143,16 @@ pub(crate) struct Pool {
     misses: u64,
     /// Free textures dropped to make room for newer ones (diagnostics, tests).
     evicted: u64,
+    /// Output frames done so far ([`GpuContext::pool_frame_end`]).
+    frame: u64,
+    /// Per size, the [`Pool::frame`] in which it was last asked for (hit or miss).
+    asked: HashMap<(u32, u32), u64>,
+    /// Bytes of evicted textures whose GPU memory may not be freed yet: wgpu frees a dropped
+    /// texture only once the submissions that used it are done. Counted against the budget
+    /// for evicting, so evicting and reallocating cannot stack up freed-but-held memory.
+    dying: Arc<std::sync::atomic::AtomicUsize>,
+    /// Reports when the submissions that may use an evicted texture are done.
+    queue: Option<wgpu::Queue>,
     /// Textures released while the [`Enc`] that took them is alive, kept for that `Enc` only.
     /// Its later commands run after everything it recorded or submitted before (one queue,
     /// recording order), so it can overwrite them at once instead of allocating a new texture
@@ -194,32 +208,72 @@ impl Pool {
         if self.budget == 0 { POOL_BUDGET } else { self.budget }
     }
 
-    /// Keep `t` on the free list, evicting the least recently freed textures until it fits:
-    /// sizes still in use keep coming back, stale ones (a blur bound or padded layer size that
-    /// no longer occurs) age out instead of filling the budget and turning every later free
-    /// into a drop and every later take into a new allocation.
+    /// Keep `t` on the free list if it fits. Otherwise make room by evicting stale sizes, least
+    /// recently freed first: sizes not asked for in the last [`STALE_FRAMES`] output frames (a
+    /// blur bound or padded layer size that no longer occurs), so they age out instead of
+    /// filling the budget for good. Sizes still in use are never evicted for a newcomer: a
+    /// frame that frees more than the budget in a repeating order would otherwise evict, on
+    /// every free, the texture the next call takes first (LRU on a cycle), and miss on every
+    /// take. If nothing stale makes room, `t` is dropped (the kept set keeps hitting).
+    ///
+    /// Evicted textures count against the budget ([`Pool::dying`]) until the GPU work
+    /// submitted so far is done, so evictions free at most one budget ahead of the GPU.
     fn make_free(&mut self, t: wgpu::Texture) {
+        use std::sync::atomic::Ordering::Relaxed;
         let b = tex_bytes(&t);
         let budget = self.budget();
         if b > budget {
             return;
         }
+        let mut evicted = 0;
         while self.bytes + b > budget {
-            let Some(oldest) = self.free.iter().filter_map(|(k, q)| q.front().map(|(_, s)| (*s, *k))).min().map(|(_, k)| k) else {
+            let frame = self.frame;
+            let asked = &self.asked;
+            let stale = |k: &(u32, u32)| asked.get(k).is_none_or(|f| frame.saturating_sub(*f) >= STALE_FRAMES);
+            let Some(oldest) = self.free.iter().filter(|(k, _)| stale(k)).filter_map(|(k, q)| q.front().map(|(_, s)| (*s, *k))).min().map(|(_, k)| k) else {
                 break;
             };
+            let ob = oldest.0 as usize * oldest.1 as usize * 16;
+            if self.dying.load(Relaxed) + evicted + ob > budget {
+                break;
+            }
             let Some(q) = self.free.get_mut(&oldest) else { break };
             if let Some((old, _)) = q.pop_front() {
                 self.bytes -= tex_bytes(&old);
+                evicted += ob;
                 self.evicted += 1;
             }
             if q.is_empty() {
                 self.free.remove(&oldest);
             }
         }
+        if evicted > 0 {
+            self.dying.fetch_add(evicted, Relaxed);
+            let dying = self.dying.clone();
+            match &self.queue {
+                Some(q) => q.on_submitted_work_done(move || {
+                    dying.fetch_sub(evicted, Relaxed);
+                }),
+                None => {
+                    dying.fetch_sub(evicted, Relaxed);
+                }
+            }
+        }
+        if self.bytes + b > budget {
+            return;
+        }
         self.bytes += b;
         self.stamp += 1;
         self.free.entry((t.width(), t.height())).or_default().push_back((t, self.stamp));
+    }
+
+    /// An output frame is done: sizes not asked for since age towards [`STALE_FRAMES`].
+    /// Returns whether evicted textures still wait for their work-done callback.
+    fn frame_end(&mut self) -> bool {
+        self.frame += 1;
+        let (frame, free) = (self.frame, &self.free);
+        self.asked.retain(|k, f| frame - *f < STALE_FRAMES || free.contains_key(k));
+        self.dying.load(std::sync::atomic::Ordering::Relaxed) > 0
     }
 
     fn open(&mut self) -> u64 {
@@ -275,10 +329,10 @@ impl Pool {
     }
 
     /// [`Enc::lent`] is done with `owner` (its work submitted or discarded): its kept textures
-    /// go to the shared free list at once. The free list has one [`POOL_BUDGET`] (oldest
-    /// evicted first), so finished calls no longer keep a budget each (16 frame threads kept up
-    /// to 16 × `POOL_BUDGET`). The budget caps the free list only: textures waiting for open
-    /// encoders ([`Pool::released`]) and those held by live `Enc`s are outside it.
+    /// go to the shared free list at once. The free list has one [`POOL_BUDGET`] (only stale
+    /// sizes are evicted), so finished calls no longer keep a budget each (16 frame threads
+    /// kept up to 16 × `POOL_BUDGET`). The budget caps the free list only: textures waiting
+    /// for open encoders ([`Pool::released`]) and those held by live `Enc`s are outside it.
     ///
     /// They skip [`Pool::release`]'s wait for open encoders: a kept texture's lease has
     /// dropped and only this `Enc` recorded work on it, which is already submitted or
@@ -303,11 +357,13 @@ impl Pool {
 
     fn take_owned(&mut self, owner: u64, w: u32, h: u32) -> Option<wgpu::Texture> {
         let t = self.owned.get_mut(&owner)?.get_mut(&(w, h))?.pop()?;
+        self.asked.insert((w, h), self.frame);
         self.hits += 1;
         Some(t)
     }
 
     fn take(&mut self, w: u32, h: u32) -> Option<wgpu::Texture> {
+        self.asked.insert((w, h), self.frame);
         let q = self.free.get_mut(&(w, h));
         let t = q.and_then(|q| q.pop_back()).map(|(t, _)| t);
         if self.free.get(&(w, h)).is_some_and(|q| q.is_empty()) {
@@ -717,6 +773,7 @@ impl GpuContext {
             init_resource(&device, "dummy storage buffer", || buffer_init(&device, &queue, Some("dummy"), &[0u8; 16], wgpu::BufferUsages::STORAGE))?;
         let dummy_tex = init_resource(&device, "dummy texture view", || dummy.create_view(&Default::default()))?;
         let max_dim = device.limits().max_texture_dimension_2d;
+        let pool = Arc::new(Mutex::new(Pool { queue: Some(queue.clone()), ..Default::default() }));
         Ok(GpuContext {
             device,
             queue,
@@ -735,7 +792,7 @@ impl GpuContext {
             uploads: Mutex::new(Uploads::default()),
             upload_budget: std::sync::atomic::AtomicUsize::new(UPLOAD_BUDGET),
             upload_full_warned: Default::default(),
-            pool: Default::default(),
+            pool,
             staging: Default::default(),
             transfers: Default::default(),
             zeros: Default::default(),
@@ -997,6 +1054,19 @@ impl GpuContext {
         if let Ok(mut p) = self.pool.lock() {
             p.clear();
         }
+    }
+
+    /// An output frame is done: the pool ages the sizes not asked for since (only sizes unused
+    /// for [`STALE_FRAMES`] frames are evicted to make room for others). Also maintains the
+    /// device without waiting, so textures evicted from the pool are freed and stop counting
+    /// against its budget ([`Pool::dying`]) once their submissions are done.
+    pub fn pool_frame_end(&self) {
+        let dying = self.pool.lock().map(|mut p| p.frame_end()).unwrap_or_default();
+        if dying {
+            // A work-done callback waits for a submission; an empty one closes the wait.
+            self.queue.submit([]);
+        }
+        let _ = self.poll_readbacks(wgpu::PollType::Poll);
     }
 
     /// Bytes the pool's free list may keep (tests lower it on a context of their own).
