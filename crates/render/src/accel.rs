@@ -87,7 +87,9 @@ pub trait Accelerator: Send + Sync {
     fn frame_begin(&self) {}
     fn pass_begin(&self) {}
     /// A render of many frames (an export) is done: drop what is kept only to speed up the
-    /// next frame (pooled working textures).
+    /// next frame (pooled working textures). Exports call it, even when they fail, panic or
+    /// are dropped; other multi-frame paths (preview, remote frames) don't, so there the pool
+    /// keeps up to its budget until the next export ends.
     fn render_end(&self) {}
     fn pass_missed(&self) -> bool {
         false
