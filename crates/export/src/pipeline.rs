@@ -361,6 +361,9 @@ impl<'a> Cx<'a> {
                 if second == first { a } else { interleave(&a, &self.render_at(second).await, upper_first) }
             }
         };
+        if let Some(a) = self.job.accel {
+            a.frame_end();
+        }
         let img = self.crop_resize(img);
         if let Some(ft) = &self.frame_times {
             ft.lock().unwrap_or_else(std::sync::PoisonError::into_inner).push((i, t0.elapsed().as_secs_f64()));
