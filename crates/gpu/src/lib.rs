@@ -367,6 +367,10 @@ impl Accelerator for Gpu {
         Some(&self.auto)
     }
 
+    fn render_end(&self) {
+        self.ctx.trim_pool();
+    }
+
     fn frame_begin(&self) {
         if let Some(d) = self.ctx.deferred() {
             d.frame_begin();
