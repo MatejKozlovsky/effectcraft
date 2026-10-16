@@ -96,6 +96,9 @@ pub trait Accelerator: Send + Sync {
     /// results, `pass_begin` clears the miss. Synchronous accelerators never miss.
     fn frame_begin(&self) {}
     fn pass_begin(&self) {}
+    /// A render of many frames (an export) is done: drop what is kept only to speed up the
+    /// next frame (pooled working textures).
+    fn render_end(&self) {}
     fn pass_missed(&self) -> bool {
         false
     }

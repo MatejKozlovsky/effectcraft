@@ -176,6 +176,9 @@ pub async fn export_async(job: &Job<'_>, progress: &mut dyn FnMut(&Progress) -> 
     let t0 = Instant::now();
     let cx = Cx::new(job);
     let mut r = export_with(&cx, progress, t0).await;
+    if let Some(a) = job.accel {
+        a.render_end();
+    }
     if matches!(r, Err(ExportError::Cancelled)) {
         cx.remove_cancelled_outputs()?;
         return r;
