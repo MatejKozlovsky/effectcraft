@@ -1072,33 +1072,24 @@ fn upload_cache_drops_textures_of_freed_buffers() {
     assert!(kept <= before + 1, "the upload cache kept {kept} textures of freed buffers (had {before})");
 }
 
-/// Sets [`crate::context::POOL_BUDGET_OVERRIDE`] and restores the default when dropped.
-struct PoolBudget;
-
-impl PoolBudget {
-    fn set(bytes: usize) -> PoolBudget {
-        crate::context::POOL_BUDGET_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
-        PoolBudget
-    }
-}
-
-impl Drop for PoolBudget {
-    fn drop(&mut self) {
-        crate::context::POOL_BUDGET_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
-    }
+/// A GPU context of its own with a small pool budget, so other tests (sharing [`gpu`]) neither
+/// see the budget nor add to what the pool keeps.
+fn private_gpu(budget: usize) -> Option<Gpu> {
+    gpu()?;
+    let g = Gpu::headless()?;
+    g.context().set_pool_budget(budget);
+    Some(g)
 }
 
 /// Review of #1523: every idle effect-call owner kept up to the pool budget of its own,
 /// outside the shared accounting, and there are as many as calls ever ran at once (16 frame
-/// threads: ~12 GB after a 4K render). The pool keeps one budget for all of them, and the end
-/// of a render drops it.
+/// threads: ~12 GB after a 4K render). Finished calls share the free list's one budget, and
+/// the end of a render drops it.
 #[test]
 fn idle_effect_calls_share_one_pool_budget() {
-    let Some(g) = gpu() else { return };
-    let ctx = g.context();
-    ctx.clear_uploads();
     let budget = 8 << 20;
-    let _b = PoolBudget::set(budget);
+    let Some(g) = private_gpu(budget) else { return };
+    let ctx = g.context();
     // 16 effect calls in flight at once, each with three 1 MB working textures.
     let mut encs: Vec<_> = (0..16).map(|_| crate::context::Enc::lent(ctx)).collect();
     for e in &mut encs {
@@ -1112,21 +1103,74 @@ fn idle_effect_calls_share_one_pool_budget() {
     let (hits, _) = ctx.pool_stats();
     drop(crate::context::Enc::lent(ctx).image(256, 256));
     assert_eq!(ctx.pool_stats().0, hits + 1, "a later effect call reuses a kept texture");
-    effectcraft_render::Accelerator::render_end(g);
+    effectcraft_render::Accelerator::render_end(&g);
     assert_eq!(ctx.pool_retained_bytes(), 0, "the end of a render drops the kept textures");
+}
+
+/// Review of #1523: a full free list rejected every new texture instead of evicting, so once
+/// sizes that no longer occur (per-frame blur bounds, padded layer sizes) filled it, a steady
+/// size never got a hit again: ~0.75 GB of dead weight plus an allocation per working texture.
+#[test]
+fn stale_sizes_do_not_starve_a_steady_size() {
+    let budget = 8 << 20;
+    let Some(g) = private_gpu(budget) else { return };
+    let ctx = g.context();
+    for k in 0..16 {
+        let mut e = crate::context::Enc::lent(ctx);
+        drop((e.image(256 + k, 256), e.image(256 + k, 256)));
+    }
+    let (hits0, misses0) = ctx.pool_stats();
+    for _ in 0..10 {
+        let mut e = crate::context::Enc::lent(ctx);
+        drop((e.image(300, 300), e.image(300, 300)));
+    }
+    let (hits, misses) = (ctx.pool_stats().0 - hits0, ctx.pool_stats().1 - misses0);
+    assert!(ctx.pool_retained_bytes() <= budget);
+    assert!(ctx.pool_evictions() > 0, "the stale sizes were evicted");
+    assert!(hits >= 18 && misses <= 2, "steady 300x300 calls after stale sizes: {hits} hits, {misses} misses");
+}
+
+/// Review of #1523: a lent call's image read by another, still open encoder must not go back to
+/// the lent call for reuse when its lease drops first: that encoder's read is not submitted yet.
+#[test]
+fn image_read_by_an_open_encoder_is_not_reused_by_its_lent_call() {
+    let Some(g) = private_gpu(8 << 20) else { return };
+    let ctx = g.context();
+    let mut frame = crate::context::Enc::new(ctx);
+    let mut lent = crate::context::Enc::lent(ctx);
+    let img = lent.image(64, 64);
+    let dst = frame.image(64, 64);
+    frame.copy_into(&img, &dst, 0, 0);
+    drop(img);
+    let (hits, _) = ctx.pool_stats();
+    drop(lent.image(64, 64));
+    assert_eq!(ctx.pool_stats().0, hits, "the lent call reused a texture an open encoder still reads");
+    drop(lent);
+    let (hits, _) = ctx.pool_stats();
+    drop(crate::context::Enc::lent(ctx).image(64, 64));
+    // The other 64x64 (the lent call's second image) is free; the read one still waits.
+    let (hits2, _) = ctx.pool_stats();
+    assert_eq!(hits2, hits + 1);
+    let (h, _) = ctx.pool_stats();
+    let mut e = crate::context::Enc::lent(ctx);
+    let a = e.image(64, 64);
+    let b = e.image(64, 64);
+    assert_eq!(ctx.pool_stats().0, h + 1, "the read texture waits for the open encoder");
+    drop((a, b, e));
+    frame.submit();
+    drop(dst);
 }
 
 /// The same through [`Gpu::effects`] from 16 threads at once, as an export's frame threads.
 #[test]
 fn effect_calls_on_16_threads_keep_one_pool_budget() {
-    let Some(g) = gpu() else { return };
     if on_gl() {
         return; // one context lock per adapter on wgpu's GL backend (see hold_gpu_lock)
     }
-    let ctx = g.context();
-    ctx.clear_uploads();
     let budget = 8 << 20;
-    let _b = PoolBudget::set(budget);
+    let Some(g) = private_gpu(budget) else { return };
+    let g = &g;
+    let ctx = g.context();
     let spec = effectcraft_effects::find("ec.blur.gaussian").unwrap();
     let size = [240.0, 240.0];
     let mut params =

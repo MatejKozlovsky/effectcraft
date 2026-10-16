@@ -902,6 +902,7 @@ fn depth_of_field(e: &mut Enc, acc: &wgpu::Buffer, depth: &wgpu::Buffer, (w, h):
 
 /// The resolved run as an image in the canvas's encoding, composited over `canvas` when given.
 pub(crate) fn finish(e: &mut Enc, r: &Resolved, encode: bool, canvas: Option<&GpuImage>) -> GpuImage {
+    canvas.inspect(|c| e.uses(c));
     let out = e.image(r.width, r.height);
     let ov = out.texture.create_view(&Default::default());
     let cv = canvas.map(|c| c.texture.create_view(&Default::default()));
@@ -1060,6 +1061,7 @@ pub(crate) fn sky(e: &mut Enc, sky: &effectcraft_render::three_d::SkyDraw, canva
 /// Wireframe-quality layer outlines: `canvas` with `pixels` set to opaque white
 /// ([`effectcraft_render::Renderer::wireframe_pixels`]).
 pub(crate) fn wireframe(e: &mut Enc, canvas: &GpuImage, pixels: &[(u32, u32)]) -> GpuImage {
+    e.uses(canvas);
     let out = e.image(canvas.width, canvas.height);
     e.copy_into(canvas, &out, 0, 0);
     if pixels.is_empty() {
