@@ -99,7 +99,7 @@ impl Drop for StackScope {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Buf, EffectCtx, Params, Value, apply, default_value, find, num};
+    use crate::{Buf, EffectCtx, Params, Value, apply, col, default_value, find, num};
     use effectcraft_raster::Image;
 
     const LAYER: [f64; 2] = [300.0, 260.0];
@@ -116,6 +116,15 @@ mod tests {
     }
     fn glow() -> Fx {
         ("ec.stylize.glow", vec![])
+    }
+    fn fill() -> Fx {
+        ("ec.generate.fill", vec![("color", col(0.2, 0.6, 1.0)), ("opacity", num(70.0))])
+    }
+    fn tint() -> Fx {
+        ("ec.color.tint", vec![("amount", num(80.0))])
+    }
+    fn hue_sat() -> Fx {
+        ("ec.color.huesaturation", vec![("hue", num(70.0)), ("saturation", num(40.0))])
     }
 
     fn run(fx: &Fx, b: Buf) -> Buf {
@@ -194,6 +203,48 @@ mod tests {
                 assert_eq!(differing(&a, &c), 0, "{w}x{h} at {at:?}: {ids:?}");
             }
         }
+    }
+
+    /// Colour effects that keep transparent pixels ([`crate::KEEPS_CLEAR`]) on an aligned buffer,
+    /// alone or around margin effects, give the covered buffer's pixels bit for bit, in a buffer
+    /// bounded by the content and the margins instead of the layer rectangle (#1205: Glow + Fill).
+    /// (A plain Gaussian Blur is left out: blurs and Glow on an aligned buffer can differ from the
+    /// cover in rounding residue below 1e-6, with or without these effects, which add none.)
+    #[test]
+    fn keeps_clear_effects_on_an_aligned_buffer_match_the_cover() {
+        let stacks: Vec<Vec<Fx>> = vec![
+            vec![glow(), fill()],
+            vec![fill(), glow()],
+            vec![tint(), glow(), hue_sat()],
+            vec![gauss(10.0, true), fill()],
+            vec![fill(), gauss(10.0, true)],
+            vec![
+                ("ec.color.exposure", vec![("master/exposure", num(0.7))]),
+                ("ec.color.brightnesscontrast", vec![("brightness", num(20.0)), ("contrast", num(35.0))]),
+            ],
+            vec![("ec.color.tritone", vec![]), displace()],
+        ];
+        for (w, h, at) in [(60, 30, [3.0, 5.0]), (50, 40, [120.0, 110.0]), (50, 40, [250.0, 220.0])] {
+            let src = content(w, h, at);
+            for fx in &stacks {
+                for f in fx {
+                    let s = find(f.0).unwrap();
+                    assert!(
+                        s.skips_cover_with(|| Params { values: s.params.iter().map(|p| (p.id.to_string(), default_value(p, LAYER))).collect() }),
+                        "{}",
+                        f.0
+                    );
+                }
+                let ids: Vec<_> = fx.iter().map(|f| f.0).collect();
+                let (a, c) = (stack(true, &src, fx), stack(false, &src, fx));
+                assert_eq!(differing(&a, &c), 0, "{w}x{h} at {at:?}: {ids:?}");
+            }
+        }
+        // Content in the middle: the buffer is the content plus Glow's margin, not the layer.
+        let a = stack(true, &content(50, 40, [120.0, 110.0]), &[glow(), fill()]);
+        let c = stack(false, &content(50, 40, [120.0, 110.0]), &[glow(), fill()]);
+        assert!(a.img.width < 200 && a.img.height < 200, "{}x{}", a.img.width, a.img.height);
+        assert!(c.img.width >= 300 && c.img.height >= 260);
     }
 
     /// The fast path still runs where it is exact: content far from the edges, blur last.

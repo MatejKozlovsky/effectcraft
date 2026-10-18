@@ -3,7 +3,8 @@
 //!
 //! Box passes run straight on row-major pixels: horizontal passes per row, vertical passes over
 //! blocks of rows with a per-column running sum (no transposes), ping-ponging between two
-//! buffers so a Gaussian allocates two images regardless of the number of passes.
+//! buffers so a Gaussian allocates two images regardless of the number of passes (one when it may
+//! overwrite its input).
 
 use rayon::prelude::*;
 
@@ -128,23 +129,47 @@ fn box_v_into(src: &[Px], out: &mut [Px], w: usize, h: usize, r: usize, repeat: 
 
 /// Run horizontal passes with radii `rx` then vertical passes with radii `ry`.
 fn box_passes(img: &Image, rx: &[usize], ry: &[usize], repeat: bool, row_phase: i64) -> Image {
-    let (w, h) = (img.width as usize, img.height as usize);
-    let passes: Vec<(bool, usize)> = rx.iter().map(|&r| (false, r)).chain(ry.iter().map(|&r| (true, r))).filter(|p| p.1 > 0).collect();
-    if passes.is_empty() || w == 0 || h == 0 {
+    let passes = pass_list(rx, ry);
+    if passes.is_empty() || img.width == 0 || img.height == 0 {
         return img.clone();
     }
     let mut a = Image::new(img.width, img.height);
-    let mut b = Image::new(img.width, img.height);
+    run_passes(Some(img), &mut a, &passes, repeat, row_phase);
+    a
+}
+
+/// [`box_passes`] on an image it may overwrite: the image is one of the two pass buffers, so
+/// one buffer of its size fewer is alive (same passes, same pixels).
+fn box_passes_owned(img: Image, rx: &[usize], ry: &[usize], repeat: bool, row_phase: i64) -> Image {
+    let passes = pass_list(rx, ry);
+    if passes.is_empty() || img.width == 0 || img.height == 0 {
+        return img;
+    }
+    let mut a = img;
+    run_passes(None, &mut a, &passes, repeat, row_phase);
+    a
+}
+
+fn pass_list(rx: &[usize], ry: &[usize]) -> Vec<(bool, usize)> {
+    rx.iter().map(|&r| (false, r)).chain(ry.iter().map(|&r| (true, r))).filter(|p| p.1 > 0).collect()
+}
+
+/// Run `passes` from `first` (or from `a` itself when `None`), ending in `a`.
+fn run_passes(first: Option<&Image>, a: &mut Image, passes: &[(bool, usize)], repeat: bool, row_phase: i64) {
+    let (w, h) = (a.width as usize, a.height as usize);
+    let mut b = Image::new(a.width, a.height);
     for (i, &(vertical, r)) in passes.iter().enumerate() {
-        let src: &[Px] = if i == 0 { &img.data } else { &a.data };
+        let src: &[Px] = match first {
+            Some(img) if i == 0 => &img.data,
+            _ => &a.data,
+        };
         if vertical {
             box_v_into(src, &mut b.data, w, h, r, repeat, row_phase);
         } else {
             box_h_into(src, &mut b.data, w, r, repeat);
         }
-        std::mem::swap(&mut a, &mut b);
+        std::mem::swap(a, &mut b);
     }
-    a
 }
 
 /// Box radii for `n` passes approximating a Gaussian of `sigma` (Kovesi / "boxes for Gauss").
@@ -184,6 +209,14 @@ pub fn gaussian_blur_phased(img: &Image, sigma_x: f64, sigma_y: f64, repeat: boo
     let rx = if sigma_x > 0.05 { box_radii(sigma_x, 3) } else { vec![] };
     let ry = if sigma_y > 0.05 { box_radii(sigma_y, 3) } else { vec![] };
     box_passes(img, &rx, &ry, repeat, row_phase)
+}
+
+/// [`gaussian_blur_phased`] consuming `img`, which it blurs in place of a fresh buffer: the
+/// same pixels with one image-sized buffer less alive.
+pub fn gaussian_blur_phased_owned(img: Image, sigma_x: f64, sigma_y: f64, repeat: bool, row_phase: i64) -> Image {
+    let rx = if sigma_x > 0.05 { box_radii(sigma_x, 3) } else { vec![] };
+    let ry = if sigma_y > 0.05 { box_radii(sigma_y, 3) } else { vec![] };
+    box_passes_owned(img, &rx, &ry, repeat, row_phase)
 }
 
 /// Motion blur along `angle_deg` (0 = vertical in AE's Directional Blur, measured clockwise from
@@ -364,6 +397,44 @@ mod tests {
                     }
                 }
             }
+        }
+    }
+
+    /// Both passes write every output pixel: the ping-pong buffers (and the owned blur's input)
+    /// hold an earlier pass's pixels when a pass writes into them.
+    #[test]
+    fn passes_write_every_pixel() {
+        let (w, h) = (23usize, 300usize);
+        let src: Vec<Px> = (0..w * h).map(|i| [(i % 7) as f32 / 7.0, 0.5, 0.25, (i % 3) as f32 / 2.0]).collect();
+        for r in [0, 1, 4, 40] {
+            for (repeat, phase) in [(false, 0), (false, 37), (true, 0), (true, 11)] {
+                let mut out = vec![[f32::NAN; 4]; w * h];
+                box_h_into(&src, &mut out, w, r, repeat);
+                assert!(out.iter().all(|p| p.iter().all(|v| v.is_finite())), "h r {r} {repeat} {phase}");
+                let mut out = vec![[f32::NAN; 4]; w * h];
+                box_v_into(&src, &mut out, w, h, r, repeat, phase);
+                assert!(out.iter().all(|p| p.iter().all(|v| v.is_finite())), "v r {r} {repeat} {phase}");
+            }
+        }
+    }
+
+    /// The owned blur (input reused as a pass buffer) gives the borrowed one's pixels bit for bit.
+    #[test]
+    fn owned_blur_matches() {
+        let mut img = Image::new(37, 90);
+        for y in 20..70 {
+            for x in 5..30 {
+                let v = ((x * 7 + y * 13) % 17) as f32 / 17.0;
+                img.set(x, y, [v * 0.3, v * 0.7, v, 1.0]);
+            }
+        }
+        for (sx, sy, repeat, phase) in [(3.0, 3.0, false, 0), (11.0, 4.0, false, 23), (0.0, 6.0, true, 0), (5.0, 0.0, false, 5), (0.0, 0.0, false, 0)] {
+            let a = gaussian_blur_phased(&img, sx, sy, repeat, phase);
+            let b = gaussian_blur_phased_owned(img.clone(), sx, sy, repeat, phase);
+            assert!(
+                (a.width, a.height) == (b.width, b.height) && a.data.iter().zip(&b.data).all(|(p, q)| p.map(f32::to_bits) == q.map(f32::to_bits)),
+                "{sx} {sy}"
+            );
         }
     }
 

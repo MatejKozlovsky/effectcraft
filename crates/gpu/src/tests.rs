@@ -1044,3 +1044,41 @@ fn static_effect_layers_draw_from_the_cache() {
     assert!(frames[1] == frames[2]);
     check("static effect layer vs CPU", compare_at(&s, opts(), t(2)), 0.0);
 }
+
+/// The renderer skips the layer cover for [`effectcraft_effects::KEEPS_CLEAR`] effects: their
+/// GPU kernels, like the CPU effects, leave every transparent pixel exactly transparent.
+#[test]
+fn keeps_clear_effects_keep_transparent_pixels_on_the_gpu() {
+    let Some(g) = gpu() else { return };
+    let cases: Vec<(&str, Vec<(&str, Value)>)> = vec![
+        ("ec.color.tint", vec![("black", c(0.1, 0.0, 0.3)), ("amount", n(80.0))]),
+        ("ec.color.tritone", vec![("shadows", c(0.0, 0.1, 0.3)), ("blend", n(30.0))]),
+        ("ec.color.brightnesscontrast", vec![("brightness", n(20.0)), ("contrast", n(35.0))]),
+        ("ec.color.brightnesscontrast", vec![("brightness", n(-10.0)), ("useLegacy", Value::Bool(true))]),
+        ("ec.color.huesaturation", vec![("hue", n(70.0)), ("saturation", n(40.0)), ("lightness", n(-20.0))]),
+        ("ec.color.huesaturation", vec![("colorize", Value::Bool(true)), ("colorizeLightness", n(15.0))]),
+        ("ec.color.exposure", vec![("master/exposure", n(0.7)), ("master/offset", n(0.05))]),
+        ("ec.generate.fill", vec![("color", c(0.2, 0.6, 1.0)), ("opacity", n(70.0))]),
+    ];
+    for (id, vals) in &cases {
+        assert!(effectcraft_effects::KEEPS_CLEAR.contains(id), "{id}");
+        let spec = effectcraft_effects::find(id).unwrap();
+        let size = [70.0, 44.0];
+        let mut params =
+            effectcraft_effects::Params { values: spec.params.iter().map(|ps| (ps.id.to_string(), effectcraft_effects::default_value(ps, size))).collect() };
+        for (k, v) in vals {
+            assert!(params.values.insert(k.to_string(), v.clone()).is_some(), "{id}: {k}");
+        }
+        let img = pattern(7, 70, 44);
+        let clear: Vec<usize> = (0..img.data.len()).filter(|&i| img.data[i][3] == 0.0).collect();
+        assert!(clear.len() > 100);
+        let buf = effectcraft_effects::Buf { img, offset: [0.0, 0.0], scale: 1.0 };
+        let ctx = effectcraft_effects::EffectCtx { params: &params, time: 0.0, layer_size: size, seed: 11, adjustment: false, env: Default::default() };
+        let cpu = (spec.render)(&ctx, buf.clone());
+        let out = effectcraft_render::Accelerator::effects(g, &[effectcraft_render::FxStep { spec, ctx }], &buf, None).expect("the GPU runs the effect");
+        for &i in &clear {
+            assert_eq!(cpu.img.data[i].map(f32::to_bits), [0; 4], "{id} {vals:?}: CPU pixel {i}");
+            assert_eq!(out.img.data[i], [0.0; 4], "{id} {vals:?}: GPU pixel {i}");
+        }
+    }
+}

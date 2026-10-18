@@ -432,6 +432,15 @@ impl Buf {
 /// skips the renderer's cover of the whole layer rectangle (#1205).
 pub const SKIPS_COVER: &[&str] = &["ec.blur.gaussian", "ec.blur.fastbox", "ec.stylize.glow", "ec.distort.turbulentdisplace"];
 
+/// Effects that recolour each pixel from itself alone and leave transparent pixels as they are
+/// (Tint, Tritone, Brightness & Contrast, Hue/Saturation and Exposure map straight colour where
+/// alpha is above 0; Fill without Invert or masks scales its colour by the pixel's alpha): the
+/// layer rectangle's cover only adds transparent pixels they keep, so with [`SKIPS_COVER`]
+/// effects they do not need it either ([`EffectSpec::skips_cover_with`]). A Glow + Fill stack
+/// on a zoomed shape otherwise covers the whole layer rectangle at the raster scale (#1205).
+pub const KEEPS_CLEAR: &[&str] =
+    &["ec.color.tint", "ec.color.tritone", "ec.color.brightnesscontrast", "ec.color.huesaturation", "ec.color.exposure", "ec.generate.fill"];
+
 /// The grid phase [`Buf::align`] keeps and the step [`cover_pad`] grows in: covers the levels
 /// of the resampling pyramid used for downscaled layers.
 pub const GRID_ALIGN: u32 = 64;
@@ -620,6 +629,19 @@ impl EffectSpec {
     /// renderer's full-layer cover and keep the pyramid grid phase (#1205).
     pub fn skips_cover(&self) -> bool {
         SKIPS_COVER.contains(&self.id)
+    }
+    /// [`EffectSpec::skips_cover`], or a [`KEEPS_CLEAR`] effect with its parameters (evaluated
+    /// only for these): Fill paints transparent pixels with Invert, and its mask coverage
+    /// depends on the buffer.
+    pub fn skips_cover_with(&self, params: impl FnOnce() -> Params) -> bool {
+        if self.skips_cover() {
+            return true;
+        }
+        if !KEEPS_CLEAR.contains(&self.id) {
+            return false;
+        }
+        let p = params();
+        self.id != "ec.generate.fill" || !p.b("invert") && !p.b("allMasks") && p.f("fillMask") < 1.0
     }
 }
 
@@ -1632,5 +1654,51 @@ mod tests {
             assert!(find(id).expect(id).skips_cover(), "{id}");
         }
         assert!(!find("ec.distort.twirl").unwrap().skips_cover());
+    }
+
+    #[test]
+    fn keeps_clear_effects_skip_cover_unless_fill_paints_clear_pixels() {
+        let with = |id: &str, vals: &[(&str, Value)]| {
+            let s = find(id).expect(id);
+            let mut p = Params { values: s.params.iter().map(|p| (p.id.to_string(), default_value(p, [100.0, 100.0]))).collect() };
+            for (k, v) in vals {
+                assert!(p.values.insert(k.to_string(), v.clone()).is_some(), "{id}: {k}");
+            }
+            s.skips_cover_with(|| p)
+        };
+        for id in KEEPS_CLEAR {
+            assert!(with(id, &[]), "{id}");
+        }
+        assert!(!with("ec.generate.fill", &[("invert", Value::Bool(true))]));
+        assert!(!with("ec.generate.fill", &[("fillMask", num(1.0))]));
+        assert!(!with("ec.generate.fill", &[("allMasks", Value::Bool(true))]));
+        // Transparent pixels stay exactly transparent (untouched), with non-default settings.
+        let mut img = Image::filled(8, 6, [0.4, 0.2, 0.1, 0.8]);
+        for x in 0..8 {
+            img.set(x, 2, [0.0; 4]);
+        }
+        for (id, vals) in [
+            ("ec.color.tint", vec![("amount", num(80.0))]),
+            ("ec.color.tritone", vec![("blend", num(30.0))]),
+            ("ec.color.brightnesscontrast", vec![("brightness", num(20.0)), ("contrast", num(35.0))]),
+            ("ec.color.brightnesscontrast", vec![("brightness", num(-10.0)), ("useLegacy", Value::Bool(true))]),
+            ("ec.color.huesaturation", vec![("colorize", Value::Bool(true)), ("colorizeLightness", num(15.0))]),
+            ("ec.color.exposure", vec![("master/exposure", num(0.7)), ("master/offset", num(0.05))]),
+            ("ec.generate.fill", vec![("opacity", num(70.0))]),
+        ] {
+            let out = run_fx(id, &vals, img.clone(), 0.0, EffectEnv::default()).img;
+            assert!((0..8).all(|x| out.get(x, 2).map(f32::to_bits) == [0; 4]), "{id} {vals:?}");
+        }
+        // Others decide without their parameters.
+        let evaluated = std::cell::Cell::new(false);
+        let params = || {
+            evaluated.set(true);
+            Params { values: HashMap::new() }
+        };
+        assert!(find("ec.stylize.glow").unwrap().skips_cover_with(params));
+        for id in ["ec.color.levels", "ec.color.curves", "ec.channel.invert", "ec.distort.twirl", "ec.generate.gradientramp"] {
+            assert!(!find(id).expect(id).skips_cover_with(params), "{id}");
+        }
+        assert!(!evaluated.get());
     }
 }

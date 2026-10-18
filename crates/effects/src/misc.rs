@@ -205,6 +205,11 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
     if !ctx.adjustment {
         b.pad((radius * 1.5).ceil() as u32 + 2);
     }
+    // Intensity 0 adds no glow: the composite below runs with a zero glow, without the bright
+    // pass and its blur (the pad stays: it places the buffer like the full render).
+    if intensity == 0.0 {
+        return glow_composite(ctx, glow_op, b, None, 0.0);
+    }
     // Bright pass.
     let mut bright = b.img.clone();
     bright.data.par_iter_mut().for_each(|px| {
@@ -229,10 +234,19 @@ fn glow(ctx: &EffectCtx, mut b: Buf) -> Buf {
         }
     });
     let s = (radius / 2.0).max(0.5);
-    let blurred = effectcraft_raster::gaussian_blur_phased(&bright, s * kx, s * ky, false, crate::stack::row_phase());
+    // Blurred in place: the bright pass's buffer is gone once the blur is done.
+    let blurred = effectcraft_raster::gaussian_blur_phased_owned(bright, s * kx, s * ky, false, crate::stack::row_phase());
+    glow_composite(ctx, glow_op, b, Some(blurred), intensity)
+}
+
+/// Glow's composite of the original `b` and the blurred glow (scaled by `intensity`; `None` =
+/// no glow, all zero).
+fn glow_composite(ctx: &EffectCtx, glow_op: effectcraft_color::BlendMode, mut b: Buf, blurred: Option<Image>, intensity: f32) -> Buf {
     let mode = ctx.params.e("operation");
-    b.img.data.par_iter_mut().zip(blurred.data.par_iter()).for_each(|(o, g)| {
-        let g = g.map(|v| v * intensity);
+    let zero = [0.0f32; 4];
+    let glow_px = |i: usize| blurred.as_ref().map_or(zero, |bl| bl.data[i].map(|v| v * intensity));
+    b.img.data.par_iter_mut().enumerate().for_each(|(i, o)| {
+        let g = glow_px(i);
         match mode {
             // Behind: the glow shows only where the original is transparent.
             1 => {
@@ -812,5 +826,40 @@ mod tests {
         let red = run(&[("colors", Value::Enum(2)), ("arbitraryMap", Value::Str("0,1 1,1|0,0 1,0|0,0 1,0".into())), ("operation", Value::Enum(2))]);
         let p = red.get(6, 12);
         assert!(p[0] > 0.05 && p[1] < 1e-4 && p[2] < 1e-4, "{p:?}");
+    }
+
+    /// Intensity 0 skips the bright pass and the blur but gives the full render's pixels: those
+    /// of a glow whose bright pass is empty (Threshold 100 %), in every Composite Original and
+    /// Glow Operation; with On Top / Add that is the input, unchanged inside the pad.
+    #[test]
+    fn glow_intensity_zero_is_a_zero_glow() {
+        let mut img = effectcraft_raster::Image::new(20, 16);
+        for y in 3..13 {
+            for x in 4..15 {
+                let (v, a) = (((x * 5 + y * 3) % 9) as f32 / 10.0, if x % 4 == 0 { 0.5 } else { 1.0 });
+                img.set(x, y, [v * 0.8 * a, v * a, 0.3 * a, a]);
+            }
+        }
+        let bits = |b: &Buf| (b.img.width, b.img.height, b.offset, b.img.data.iter().map(|p| p.map(f32::to_bits)).collect::<Vec<_>>());
+        for (op, gop) in [(0, 1), (1, 1), (2, 1), (0, 0), (0, 2), (0, 11), (0, 13)] {
+            let run = |extra: [(&str, Value); 2]| {
+                let mut vals = vec![("operation", Value::Enum(op)), ("glowOperation", Value::Enum(gop)), ("radius", num(6.0))];
+                vals.extend(extra);
+                run_fx("ec.stylize.glow", &vals, img.clone(), 0.0, EffectEnv::default())
+            };
+            let zero = run([("intensity", num(0.0)), ("threshold", num(60.0))]);
+            let dark = run([("intensity", num(1.0)), ("threshold", num(100.0))]);
+            assert_eq!(bits(&zero), bits(&dark), "operation {op}, glow operation {gop}");
+        }
+        let b = run_fx("ec.stylize.glow", &[("intensity", num(0.0))], img.clone(), 0.0, EffectEnv::default());
+        let pad = b.offset[0] as u32;
+        assert!(pad > 0 && b.img.width == img.width + 2 * pad && b.offset[1] == pad as f64);
+        for y in 0..b.img.height {
+            for x in 0..b.img.width {
+                let inside = (pad..pad + img.width).contains(&x) && (pad..pad + img.height).contains(&y);
+                let want = if inside { img.get(x as i64 - pad as i64, y as i64 - pad as i64) } else { [0.0; 4] };
+                assert_eq!(b.img.get(x as i64, y as i64).map(f32::to_bits), want.map(f32::to_bits), "({x}, {y})");
+            }
+        }
     }
 }
