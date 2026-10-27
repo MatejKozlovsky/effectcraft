@@ -1504,3 +1504,119 @@ fn frames_outside_the_export_pipeline_age_the_pool() {
     assert!(ctx.pool_retained_bytes() <= budget);
     assert!(ctx.pool_evictions() > evicted0, "rendered frames did not age the pool: stale sizes were never evicted");
 }
+
+/// #1550: with a small `EFFECTCRAFT_GPU_MEMCAP_MB` on a backend that reports allocator usage
+/// (Vulkan, DX12), `Enc::mem_gate` stays quiet when the bytes over the cap are non-reclaimable
+/// (live uploads), submits and waits when dropped working textures push reclaimable bytes over
+/// the cap, and carries on without retiring the context if a wait times out.
+#[test]
+fn mem_gate_reclaims_over_cap_and_tolerates_timeout() {
+    const ENV: &str = "EFFECTCRAFT_GPU_MEMCAP_TEST_CHILD";
+    if std::env::var_os(ENV).is_none() {
+        let exe = std::env::current_exe().expect("test binary path");
+        let out = std::process::Command::new(exe)
+            .env(ENV, "1")
+            .env("EFFECTCRAFT_GPU_MEMCAP_MB", "8")
+            .args(["--exact", "tests::mem_gate_reclaims_over_cap_and_tolerates_timeout", "--nocapture"])
+            .output()
+            .expect("spawn child test process");
+        assert!(
+            out.status.success(),
+            "child test failed (status {:?}):\nstdout:\n{}\nstderr:\n{}",
+            out.status.code(),
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr),
+        );
+        return;
+    }
+
+    let Some(g) = Gpu::headless() else { return };
+    let ctx = g.context();
+    if ctx.allocated_bytes() == 0 {
+        return; // backend has no allocator report (Metal, GL, WebGPU)
+    }
+
+    // 1. Non-reclaimable memory (upload cache) over the 8 MiB cap must not trigger waits.
+    let img = pattern(7, 512, 512); // 4 MiB in RGBA f32
+    let held: Vec<_> = (0..3)
+        .map(|i| {
+            let b = std::sync::Arc::new(effectcraft_effects::Buf { img: img.clone(), offset: [i as f64, 0.0], scale: 1.0 });
+            ctx.upload_buf(&b).expect("upload");
+            b
+        })
+        .collect();
+    let idx = ctx.queue.submit([]);
+    let _ = ctx.poll_readbacks(wgpu::PollType::Wait { submission_index: Some(idx), timeout: Some(std::time::Duration::from_secs(1)) });
+    assert!(ctx.allocated_bytes() > (8 << 20), "uploads should put the allocator over the 8 MiB cap (got {} B)", ctx.allocated_bytes());
+    {
+        let mut e = crate::context::Enc::new(ctx);
+        for _ in 0..16 {
+            e.mem_gate();
+        }
+    }
+    assert_eq!(ctx.memcap_waits(), 0, "mem_gate must not wait when over-cap memory is held by live uploads");
+    drop(held);
+    ctx.clear_uploads();
+    ctx.pool_frame_end();
+
+    // 2. Dropped working textures over the 2 MiB pool budget and 8 MiB cap trigger a wait and
+    // free the dropped textures in wgpu's allocator.
+    let mut e = crate::context::Enc::new(ctx);
+    let mut peak_before_wait = 0u64;
+    for k in 0..16u32 {
+        let a = e.image(512 + k * 16, 256); // ~2 MiB each, distinct sizes
+        let b = e.image(512 + k * 16, 256);
+        e.copy_into(&a, &b, 0, 0);
+        drop((a, b));
+        peak_before_wait = peak_before_wait.max(ctx.allocated_bytes());
+        e.mem_gate();
+    }
+    drop(e);
+    assert!(peak_before_wait > (8 << 20), "working textures should push allocator over 8 MiB before a wait (peak {} B)", peak_before_wait);
+    let waits = ctx.memcap_waits();
+    assert!(waits > 0, "mem_gate should have waited once reclaimable bytes exceeded the cap");
+    assert!(
+        ctx.allocated_bytes() < peak_before_wait,
+        "waiting should reclaim dropped textures (peak {} B, after {} B)",
+        peak_before_wait,
+        ctx.allocated_bytes()
+    );
+    assert!(ctx.check_health().is_ok());
+
+    // 3. A zero-timeout wait must not retire the context or break subsequent renders.
+    ctx.set_memcap_wait_timeout(std::time::Duration::ZERO);
+    {
+        let mut e = crate::context::Enc::lent(ctx);
+        for k in 0..16u32 {
+            let a = e.image(384 + k * 16, 256);
+            let b = e.image(384 + k * 16, 256);
+            e.copy_into(&a, &b, 0, 0);
+            drop((a, b));
+            e.mem_gate();
+        }
+    }
+    assert!(ctx.memcap_waits() > waits, "mem_gate should have fired again under zero timeout");
+    assert!(ctx.check_health().is_ok(), "a mem_gate wait timeout must carry on without retiring the context");
+    let s = blend_scene(BitDepth::Bpc8, BlendMode::Screen);
+    let r = Renderer::new(&s.p, &Pattern, opts());
+    assert!(g.render(&r, s.cid, Tick::ZERO).is_some(), "context renders normally after a zero-timeout mem_gate wait");
+
+    // 4. Non-blocking polls (`Gpu::poll`, `pool_frame_end`) skip when `poll_lock` is held by
+    // another thread, and `read_buffer` waits for `poll_lock` without consuming its deadline.
+    // Drain any dying pool textures first so the timed path takes Poll (try_lock) rather than Wait.
+    ctx.pool_frame_end();
+    let (locked_tx, locked_rx) = std::sync::mpsc::channel();
+    std::thread::scope(|sc| {
+        sc.spawn(|| {
+            let _guard = ctx.lock_poll_for_test();
+            locked_tx.send(()).unwrap();
+            std::thread::sleep(std::time::Duration::from_millis(60));
+        });
+        locked_rx.recv().unwrap();
+        let t0 = std::time::Instant::now();
+        g.poll();
+        ctx.pool_frame_end();
+        assert!(t0.elapsed() < std::time::Duration::from_millis(30), "non-blocking polls must not wait on a contended poll_lock (took {:?})", t0.elapsed());
+        assert!(g.render(&r, s.cid, Tick::ZERO).is_some(), "readback waits for poll_lock and succeeds without retiring the context");
+    });
+}
