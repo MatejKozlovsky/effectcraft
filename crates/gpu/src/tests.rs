@@ -1512,6 +1512,7 @@ fn frames_outside_the_export_pipeline_age_the_pool() {
 #[test]
 fn mem_gate_reclaims_over_cap_and_tolerates_timeout() {
     const ENV: &str = "EFFECTCRAFT_GPU_MEMCAP_TEST_CHILD";
+    const SKIP: &str = "mem_gate_reclaims_over_cap_and_tolerates_timeout: skipped";
     if std::env::var_os(ENV).is_none() {
         let exe = std::env::current_exe().expect("test binary path");
         let out = std::process::Command::new(exe)
@@ -1527,13 +1528,22 @@ fn mem_gate_reclaims_over_cap_and_tolerates_timeout() {
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr),
         );
+        // The child's output is captured: pass its skip line on.
+        String::from_utf8_lossy(&out.stderr).lines().filter(|l| l.starts_with(SKIP)).for_each(|l| eprintln!("{l}"));
         return;
     }
 
-    let Some(g) = Gpu::headless() else { return };
+    // EFFECTCRAFT_REQUIRE_GPU=1 (inherited from the parent) fails on a GPU that didn't start.
+    let g = Gpu::try_headless();
+    let Some(g) = require_gpu("mem_gate child", g.as_ref()) else {
+        eprintln!("{SKIP}: no GPU ({})", g.as_ref().err().map_or("", String::as_str));
+        return;
+    };
     let ctx = g.context();
     if ctx.allocated_bytes() == 0 {
-        return; // backend has no allocator report (Metal, GL, WebGPU)
+        // The backend has no allocator report (Metal, GL, WebGPU): the gate never engages.
+        eprintln!("{SKIP}: adapter {} reports no allocator usage", ctx.name);
+        return;
     }
 
     // 1. Non-reclaimable memory (upload cache) over the 8 MiB cap must not trigger waits.

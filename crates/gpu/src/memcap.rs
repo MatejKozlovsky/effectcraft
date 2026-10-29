@@ -23,6 +23,9 @@ const EVERY: u64 = 8;
 const GIB: u64 = 1 << 30;
 const MIB: u64 = 1 << 20;
 
+/// Overrides the default cap: whole MiB, 0 turns the gate off.
+const MEMCAP_ENV: &str = "EFFECTCRAFT_GPU_MEMCAP_MB";
+
 pub(crate) struct MemCap {
     cap: u64,
     hysteresis: u64,
@@ -37,12 +40,12 @@ pub(crate) struct MemCap {
 
 impl MemCap {
     pub(crate) fn new(info: &wgpu::AdapterInfo) -> MemCap {
-        let env = std::env::var("EFFECTCRAFT_GPU_MEMCAP_MB").ok();
+        let env = std::env::var(MEMCAP_ENV).ok();
         Self::from_env(env.as_deref(), info.device_type)
     }
 
     fn from_env(var: Option<&str>, device_type: wgpu::DeviceType) -> MemCap {
-        let cap = var.and_then(|v| v.trim().parse::<u64>().ok()).map_or_else(|| default_cap(device_type), |mb| mb << 20);
+        let cap = cap_from_env(var, device_type);
         MemCap {
             cap,
             hysteresis: default_hysteresis(cap),
@@ -122,6 +125,20 @@ impl MemCap {
     }
 }
 
+/// The cap from the `EFFECTCRAFT_GPU_MEMCAP_MB` value: whole MiB (0 turns the gate off), or the
+/// default for `device_type` when unset, or (with a warning) when not a number or too large.
+fn cap_from_env(var: Option<&str>, device_type: wgpu::DeviceType) -> u64 {
+    let Some(v) = var else { return default_cap(device_type) };
+    match v.trim().parse::<u64>().ok().and_then(|mb| mb.checked_mul(MIB)) {
+        Some(cap) => cap,
+        None => {
+            let cap = default_cap(device_type);
+            log::warn!(target: "effectcraft_gpu", "{MEMCAP_ENV}={v:?} is not a whole number of MiB that fits in 64 bits: using {} MiB", cap / MIB);
+            cap
+        }
+    }
+}
+
 /// Discrete cards: 3 GiB, low enough to fire on 4–8 GB cards with headroom for the driver and
 /// desktop while leaving ~1 GiB above the default 1.5 GiB upload cache + 256 MB pool (larger
 /// cards can raise it with `EFFECTCRAFT_GPU_MEMCAP_MB`). Integrated and software adapters share
@@ -152,7 +169,19 @@ mod tests {
         let due = (0..2 * EVERY).filter(|_| m.due()).count();
         assert_eq!(due, 2);
         let off = MemCap::from_env(Some("0"), wgpu::DeviceType::DiscreteGpu);
+        assert_eq!(off.cap(), 0);
         assert!((0..EVERY).all(|_| !off.due()));
+    }
+
+    #[test]
+    fn override_is_whole_mib_or_the_default() {
+        let cap = |v| MemCap::from_env(Some(v), wgpu::DeviceType::DiscreteGpu).cap();
+        assert_eq!(cap("2048"), 2 * GIB);
+        assert_eq!(cap(" 8 "), 8 * MIB);
+        assert_eq!(cap("17592186044415"), 17592186044415 * MIB, "the largest value that fits");
+        for bad in ["", "lots", "-1", "1.5", "17592186044416", "99999999999999999999"] {
+            assert_eq!(cap(bad), 3 * GIB, "{bad:?} falls back to the default");
+        }
     }
 
     #[test]

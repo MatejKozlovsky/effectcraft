@@ -1783,7 +1783,7 @@ impl<'g> Enc<'g> {
             (b > a).then(|| (a as u32, (a - o) as u32, (b - a) as u32))
         };
         let (Some((sx, dx, cw)), Some((sy, dy, ch))) = (span(x, w, src.width), span(y, h, src.height)) else { return dst };
-        let enc = self.encoder();
+        let enc = self.record(&[src, &dst]);
         enc.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x: sx, y: sy, z: 0 }, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d { x: dx, y: dy, z: 0 }, aspect: wgpu::TextureAspect::All },
