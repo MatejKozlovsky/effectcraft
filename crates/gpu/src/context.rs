@@ -970,6 +970,23 @@ impl GpuContext {
         })
     }
 
+    /// Waits on `submission_index` up to `timeout` so wgpu frees resources dropped before that
+    /// submission. A timeout simply moves on without retiring the context or its readbacks; any
+    /// other poll error retires the readbacks through the failure path.
+    fn poll_wait(&self, submission_index: wgpu::SubmissionIndex, timeout: std::time::Duration) {
+        if self.readbacks.check().is_err() {
+            return;
+        }
+        match self.device.poll(wgpu::PollType::Wait { submission_index: Some(submission_index), timeout: Some(timeout) }) {
+            Ok(_) | Err(wgpu::PollError::Timeout) => {}
+            Err(e) => {
+                let error = format!("GPU poll wait: {e}");
+                self.readbacks.retire(error.clone());
+                log::error!("{error}");
+            }
+        }
+    }
+
     /// Start a bounded buffer mapping. Retired contexts reject new requests immediately.
     pub(crate) fn map_readback(
         &self,
@@ -1251,16 +1268,18 @@ impl GpuContext {
     }
 
     /// An output frame is done: the pool ages the sizes not asked for since (only sizes unused
-    /// for [`STALE_FRAMES`] frames are evicted to make room for others). Also maintains the
-    /// device without waiting, so textures evicted from the pool are freed and stop counting
-    /// against its budget ([`Pool::dying`]) once their submissions are done.
+    /// for [`STALE_FRAMES`] frames are evicted to make room for others). When evicted textures
+    /// still count ([`Pool::dying`]), it waits so their work-done callbacks clear that count
+    /// before the next frame; otherwise it only polls.
     pub fn pool_frame_end(&self) {
         let dying = self.pool.lock().map(|mut p| p.frame_end()).unwrap_or_default();
         if dying {
             // A work-done callback waits for a submission; an empty one closes the wait.
-            self.queue.submit([]);
+            let index = self.queue.submit([]);
+            self.poll_wait(index, crate::readback::TIMEOUT);
+        } else {
+            let _ = self.poll_readbacks(wgpu::PollType::Poll);
         }
-        let _ = self.poll_readbacks(wgpu::PollType::Poll);
     }
 
     /// Bytes the pool's free list may keep (tests lower it on a context of their own).
@@ -1608,7 +1627,7 @@ impl<'g> Enc<'g> {
             (b > a).then(|| (a as u32, (a - o) as u32, (b - a) as u32))
         };
         let (Some((sx, dx, cw)), Some((sy, dy, ch))) = (span(x, w, src.width), span(y, h, src.height)) else { return dst };
-        let enc = self.encoder();
+        let enc = self.record(&[src, &dst]);
         enc.copy_texture_to_texture(
             wgpu::TexelCopyTextureInfo { texture: &src.texture, mip_level: 0, origin: wgpu::Origin3d { x: sx, y: sy, z: 0 }, aspect: wgpu::TextureAspect::All },
             wgpu::TexelCopyTextureInfo { texture: &dst.texture, mip_level: 0, origin: wgpu::Origin3d { x: dx, y: dy, z: 0 }, aspect: wgpu::TextureAspect::All },
