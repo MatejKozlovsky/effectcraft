@@ -1372,6 +1372,37 @@ fn stale_sizes_do_not_starve_a_steady_size() {
     assert!(hits >= 18 && misses <= 2, "steady 300x300 calls after stale sizes: {hits} hits, {misses} misses");
 }
 
+/// Review of #1523: a `pool_frame_end` wait that clears none of the evicted bytes (timeout, or
+/// callbacks that never run) must not re-wait on every later frame while `dying` stays put.
+#[test]
+fn a_wait_without_progress_is_not_repeated() {
+    let Some(g) = private_gpu(8 << 20) else { return };
+    let ctx = g.context();
+    let phantom = 1 << 20;
+    ctx.pool_charge_dying(phantom as isize);
+    ctx.pool_frame_end();
+    assert_eq!(ctx.pool_waits(), 1, "first frame with dying bytes waits once");
+    for _ in 0..3 {
+        ctx.pool_frame_end();
+    }
+    assert_eq!(ctx.pool_waits(), 1, "no progress: later frames must not wait again");
+    ctx.pool_charge_dying(-(phantom as isize));
+    ctx.pool_frame_end();
+    assert_eq!(ctx.pool_waits(), 1, "dying cleared: poll only, stall cleared");
+    ctx.pool_charge_dying(phantom as isize);
+    ctx.pool_frame_end();
+    assert_eq!(ctx.pool_waits(), 2, "a new stall waits once");
+    // Partial progress: more dying while stalled → still no wait; drop below stalled → wait.
+    let extra = phantom / 2;
+    ctx.pool_charge_dying(extra as isize);
+    ctx.pool_frame_end();
+    assert_eq!(ctx.pool_waits(), 2, "dying above stalled: poll only");
+    ctx.pool_charge_dying(-(extra as isize + 1));
+    ctx.pool_frame_end();
+    assert_eq!(ctx.pool_waits(), 3, "dying dropped below stalled: wait again");
+    ctx.pool_charge_dying(-((phantom - 1) as isize));
+}
+
 /// RTX 3090 4K runs of #1523: evicting the least recently freed texture to fit every newcomer
 /// thrashes when a frame frees more than the budget in a repeating order (blur/glow
 /// intermediates): each free evicts the size the next call takes first, so every take

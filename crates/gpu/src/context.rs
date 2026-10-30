@@ -161,6 +161,13 @@ pub(crate) struct Pool {
     /// texture only once the submissions that used it are done. Counted against the budget
     /// for evicting, so evicting and reallocating cannot stack up freed-but-held memory.
     dying: Arc<std::sync::atomic::AtomicUsize>,
+    /// The [`Pool::dying`] bytes left after a [`GpuContext::pool_frame_end`] wait that cleared
+    /// none of them (`0` = not stalled). While `dying` does not drop below it, later frames only
+    /// poll instead of waiting again (each wait could take up to [`crate::readback::TIMEOUT`]
+    /// when the queue stopped completing work).
+    stalled: usize,
+    /// Number of empty-submission waits from [`GpuContext::pool_frame_end`] (diagnostics, tests).
+    waits: u64,
     /// Reports when the submissions that may use an evicted texture are done.
     queue: Option<wgpu::Queue>,
     /// Textures released while the [`Enc`] that took them is alive, kept for that `Enc` only.
@@ -334,10 +341,10 @@ impl Pool {
             let dying = self.dying.clone();
             match &self.queue {
                 Some(q) => q.on_submitted_work_done(move || {
-                    dying.fetch_sub(evicted, Relaxed);
+                    let _ = dying.try_update(Relaxed, Relaxed, |d| Some(d.saturating_sub(evicted)));
                 }),
                 None => {
-                    dying.fetch_sub(evicted, Relaxed);
+                    let _ = dying.try_update(Relaxed, Relaxed, |d| Some(d.saturating_sub(evicted)));
                 }
             }
         }
@@ -350,12 +357,34 @@ impl Pool {
     }
 
     /// An output frame is done: sizes not asked for since age towards [`STALE_FRAMES`].
-    /// Returns whether evicted textures still wait for their work-done callback.
-    fn frame_end(&mut self) -> bool {
+    /// Returns the evicted bytes the caller should wait for: 0 when none still count, or when a
+    /// previous wait cleared none and none has been freed since.
+    fn frame_end(&mut self) -> usize {
         self.frame += 1;
         let (frame, free) = (self.frame, &self.free);
         self.asked.retain(|k, f| frame - *f < STALE_FRAMES || free.contains_key(k));
-        self.dying.load(std::sync::atomic::Ordering::Relaxed) > 0
+        let d = self.dying.load(std::sync::atomic::Ordering::Relaxed);
+        if d == 0 {
+            self.stalled = 0;
+            return 0;
+        }
+        if self.stalled != 0 && d >= self.stalled {
+            // No progress since the stalled wait: do not wait again.
+            return 0;
+        }
+        self.stalled = 0;
+        d
+    }
+
+    /// A [`GpuContext::pool_frame_end`] wait finished with `before` dying bytes still counted
+    /// beforehand. A wait that freed nothing (timed out, or callbacks not run synchronously,
+    /// e.g. on WebGPU where poll does not block) marks the pool stalled.
+    fn waited(&mut self, before: usize) {
+        self.waits += 1;
+        let d = self.dying.load(std::sync::atomic::Ordering::Relaxed);
+        if d >= before {
+            self.stalled = d;
+        }
     }
 
     fn open(&mut self) -> u64 {
@@ -1269,14 +1298,18 @@ impl GpuContext {
 
     /// An output frame is done: the pool ages the sizes not asked for since (only sizes unused
     /// for [`STALE_FRAMES`] frames are evicted to make room for others). When evicted textures
-    /// still count ([`Pool::dying`]), it waits so their work-done callbacks clear that count
-    /// before the next frame; otherwise it only polls.
+    /// still count ([`Pool::dying`]), waits once so their work-done callbacks can clear that
+    /// count; if the wait frees none of them, later frames only poll until `dying` drops (a
+    /// stopped queue must not re-wait [`crate::readback::TIMEOUT`] on every frame).
     pub fn pool_frame_end(&self) {
-        let dying = self.pool.lock().map(|mut p| p.frame_end()).unwrap_or_default();
-        if dying {
+        let before = self.pool.lock().map(|mut p| p.frame_end()).unwrap_or_default();
+        if before > 0 {
             // A work-done callback waits for a submission; an empty one closes the wait.
             let index = self.queue.submit([]);
             self.poll_wait(index, crate::readback::TIMEOUT);
+            if let Ok(mut p) = self.pool.lock() {
+                p.waited(before);
+            }
         } else {
             let _ = self.poll_readbacks(wgpu::PollType::Poll);
         }
@@ -1294,6 +1327,27 @@ impl GpuContext {
     #[cfg(test)]
     pub(crate) fn pool_evictions(&self) -> u64 {
         self.pool.lock().map(|p| p.evicted).unwrap_or_default()
+    }
+
+    /// Empty-submission waits from [`GpuContext::pool_frame_end`].
+    #[cfg(test)]
+    pub(crate) fn pool_waits(&self) -> u64 {
+        self.pool.lock().map(|p| p.waits).unwrap_or_default()
+    }
+
+    /// Add or subtract phantom [`Pool::dying`] bytes without a work-done callback (tests that
+    /// simulate a queue which stopped completing work).
+    #[cfg(test)]
+    pub(crate) fn pool_charge_dying(&self, bytes: isize) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if let Ok(p) = self.pool.lock() {
+            if bytes >= 0 {
+                p.dying.fetch_add(bytes as usize, Relaxed);
+            } else {
+                let sub = (-bytes) as usize;
+                let _ = p.dying.try_update(Relaxed, Relaxed, |d| Some(d.saturating_sub(sub)));
+            }
+        }
     }
 
     /// Texture pool counters: (working textures reused, newly allocated).
@@ -1865,6 +1919,30 @@ impl<'g> Enc<'g> {
 /// Mip levels of a full chain for a `w × h` texture (down to 1 × 1).
 pub(crate) fn mip_levels(w: u32, h: u32) -> u32 {
     u32::BITS - w.max(h).max(1).leading_zeros()
+}
+
+#[cfg(test)]
+mod pool_stall_tests {
+    use super::Pool;
+    use std::sync::atomic::Ordering::Relaxed;
+
+    #[test]
+    fn frame_end_skips_wait_while_stalled_until_dying_drops() {
+        let mut p = Pool::default();
+        p.dying.store(100, Relaxed);
+        assert_eq!(p.frame_end(), 100);
+        p.waited(100);
+        assert_eq!(p.stalled, 100);
+        assert_eq!(p.waits, 1);
+        assert_eq!(p.frame_end(), 0);
+        p.dying.store(150, Relaxed);
+        assert_eq!(p.frame_end(), 0);
+        p.dying.store(50, Relaxed);
+        assert_eq!(p.frame_end(), 50);
+        assert_eq!(p.stalled, 0);
+        p.dying.store(0, Relaxed);
+        assert_eq!(p.frame_end(), 0);
+    }
 }
 
 #[cfg(test)]
